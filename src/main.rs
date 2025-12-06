@@ -265,7 +265,7 @@ async fn connect_nostr(npub_str: String, app: Arc<Mutex<App>>, tx: mpsc::Sender<
     while let Ok(notification) = notifications.recv().await {
         if let RelayPoolNotification::Event { event, .. } = notification {
             if event.kind == Kind::TextNote {
-                let content = event.content.clone();
+                let content = clean_content(&event.content);
                 // Get author display name
                 let author_name = author_map.get(&event.pubkey).cloned().unwrap_or_else(|| {
                      // Initial chars of pubkey
@@ -280,6 +280,12 @@ async fn connect_nostr(npub_str: String, app: Arc<Mutex<App>>, tx: mpsc::Sender<
     }
 
     Ok(())
+}
+
+fn clean_content(input: &str) -> String {
+    input.chars()
+        .filter(|c| !c.is_control() || *c == '\n' || *c == '\t')
+        .collect()
 }
 
 fn ui(f: &mut Frame, app: &App) {

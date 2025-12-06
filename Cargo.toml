@@ -1,0 +1,11 @@
+[package]
+name = "cyberdeckstr"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.100"
+crossterm = "0.29.0"
+nostr-sdk = "0.44.1"
+ratatui = "0.29.0"
+tokio = { version = "1.48.0", features = ["full"] }

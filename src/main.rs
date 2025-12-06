@@ -330,32 +330,32 @@ fn ui(f: &mut Frame, app: &App) {
              f.render_widget(loading, chunks[1]);
         }
         AppState::Feed => {
+            // Calculate available width for text
+            // Chunks[1] width - 2 (borders) - 2 (left/right padding if any, let's say 2 for safety)
+            let max_width = chunks[1].width.saturating_sub(4) as usize;
+
             let messages: Vec<ListItem> = app.messages
                 .iter()
                 .map(|m| {
-                    ListItem::new(vec![
-                        Line::from(Span::raw("")), // Spacer
-                        Line::from(Span::styled(m, text_style)),
-                        Line::from(Span::styled("---", Style::default().fg(Color::DarkGray))),
-                    ])
+                    // Wrap the message
+                    let wrapped_lines = textwrap::wrap(m, max_width);
+                    
+                    let mut lines = vec![Line::from(Span::raw(""))]; // Spacer
+                    
+                    for line in wrapped_lines {
+                        lines.push(Line::from(Span::styled(line.to_string(), text_style)));
+                    }
+                    
+                    lines.push(Line::from(Span::styled("---", Style::default().fg(Color::DarkGray))));
+                    
+                    ListItem::new(lines)
                 })
                 .collect();
             
             let messages_list = List::new(messages)
                 .block(Block::default().borders(Borders::ALL).border_style(border_style).title(" LIVE FEED "))
-                .highlight_style(highlight_style); // Not really selecting, but style is nice
+                .highlight_style(highlight_style); 
 
-            // We need a stateful widget to scroll properly, but for simplicity in this MVP 
-            // we will just render the list with the stored scroll offset by creating an iterator 
-            // or just showing the last N messages that fit. 
-            // Ratatui List handles scrolling if we manage state, but here let's just reverse render 
-            // or keep it simple.
-            
-            // To make it auto-scroll, we'll implement a simple window logic.
-            // Actually, `List` doesn't auto-scroll without `ListState`.
-            // Let's use a Paragraph for the feed instead, passing logic is simpler for valid text stream?
-            // No, List is better for items.
-            // Let's create a temporary ListState.
             let mut state = ratatui::widgets::ListState::default();
             state.select(Some(app.scroll));
             

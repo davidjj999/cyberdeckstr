@@ -10,9 +10,11 @@ use ratatui::{
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, Paragraph},
+    widgets::{Axis, Block, Borders, Chart, Dataset, GraphType, List, ListItem, Paragraph},
+    symbols,
     Frame, Terminal,
 };
+use serde::Deserialize;
 use std::{io, sync::Arc, time::Duration};
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
@@ -35,6 +37,12 @@ struct App {
     status: String,
     scroll: usize,
     client: Option<Client>,
+    btc_history: Vec<(f64, f64)>,
+}
+
+#[derive(Deserialize)]
+struct MarketChart {
+    prices: Vec<(f64, f64)>,
 }
 
 impl App {
@@ -46,6 +54,7 @@ impl App {
             status: "Welcome to CYBERDECKSTR. Enter NPUB.".to_string(),
             scroll: 0,
             client: None,
+            btc_history: Vec::new(),
         }
     }
 }
@@ -61,6 +70,12 @@ async fn main() -> Result<()> {
 
     // Create App state
     let app = Arc::new(Mutex::new(App::new()));
+
+    // Spawn BTC data fetcher
+    let app_btc = app.clone();
+    tokio::spawn(async move {
+        fetch_btc_data(app_btc).await;
+    });
 
     // Channel for conveying events from the Nostr client task to the UI
     let (tx, rx) = mpsc::channel::<String>(100);
@@ -282,6 +297,27 @@ async fn connect_nostr(npub_str: String, app: Arc<Mutex<App>>, tx: mpsc::Sender<
     Ok(())
 }
 
+async fn fetch_btc_data(app: Arc<Mutex<App>>) {
+    let client = reqwest::Client::new();
+    loop {
+         // Fetch last 24 hours (1 day)
+         let url = "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart?vs_currency=usd&days=1";
+         match client.get(url).header("User-Agent", "cyberdeckstr/1.0").send().await {
+             Ok(resp) => {
+                 if let Ok(chart_data) = resp.json::<MarketChart>().await {
+                     let mut app_guard = app.lock().await;
+                     app_guard.btc_history = chart_data.prices;
+                 }
+             }
+             Err(_e) => { 
+                 // Silently fail request or log if we had logging
+             }
+         }
+         // Update every 60 seconds
+         tokio::time::sleep(Duration::from_secs(60)).await;
+    }
+}
+
 fn clean_content(input: &str) -> String {
     input.chars()
         .filter(|c| !c.is_control() || *c == '\n' || *c == '\t')
@@ -301,9 +337,10 @@ fn ui(f: &mut Frame, app: &App) {
         .margin(1)
         .constraints(
             [
-                Constraint::Length(3), // Header
-                Constraint::Min(0),    // Content
-                Constraint::Length(3), // Status
+                Constraint::Length(3),  // Header
+                Constraint::Length(12), // BTC Chart
+                Constraint::Min(0),     // Content
+                Constraint::Length(3),  // Status
             ]
             .as_ref(),
         )
@@ -321,24 +358,78 @@ fn ui(f: &mut Frame, app: &App) {
         .block(Block::default().borders(Borders::ALL).border_style(border_style).title(" CYBERDECKSTR 1.0 "));
     f.render_widget(header, chunks[0]);
 
+    // BTC Chart
+    let chart_block = Block::default()
+        .title(" BTC/USD (24H) ")
+        .borders(Borders::ALL)
+        .border_style(border_style);
+
+    let datasets = vec![
+        Dataset::default()
+            .name("Price")
+            .marker(symbols::Marker::Braille)
+            .style(Style::default().fg(CYBER_GREEN))
+            .graph_type(GraphType::Line)
+            .data(&app.btc_history),
+    ];
+
+    // Calculate bounds
+    let (min_x, max_x, min_y, max_y) = if app.btc_history.is_empty() {
+        (0.0, 100.0, 0.0, 100.0)
+    } else {
+        let xs: Vec<f64> = app.btc_history.iter().map(|(x, _)| *x).collect();
+        let ys: Vec<f64> = app.btc_history.iter().map(|(_, y)| *y).collect();
+        (
+            xs.first().cloned().unwrap_or(0.0),
+            xs.last().cloned().unwrap_or(100.0),
+            ys.iter().cloned().fold(f64::INFINITY, f64::min),
+            ys.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
+        )
+    };
+
+    let chart = Chart::new(datasets)
+        .block(chart_block)
+        .x_axis(
+            Axis::default()
+                .title("Time")
+                .style(Style::default().fg(Color::Gray))
+                .bounds([min_x, max_x])
+                // We'll just show start/end labels or nothing for simplicity as timestamps are huge
+                .labels(vec![
+                    Span::styled(" -24h ", Style::default().add_modifier(Modifier::BOLD)),
+                    Span::styled(" Now ", Style::default().add_modifier(Modifier::BOLD)),
+                ]),
+        )
+        .y_axis(
+            Axis::default()
+                .title("Price")
+                .style(Style::default().fg(Color::Gray))
+                .bounds([min_y, max_y])
+                .labels(vec![
+                    Span::styled(format!("{:.0}", min_y), Style::default().add_modifier(Modifier::BOLD)),
+                    Span::styled(format!("{:.0}", max_y), Style::default().add_modifier(Modifier::BOLD)),
+                ]),
+        );
+    f.render_widget(chart, chunks[1]);
+
     // Content
     match app.state {
         AppState::Login => {
             let input = Paragraph::new(app.input.as_str())
                 .style(text_style)
                 .block(Block::default().borders(Borders::ALL).border_style(border_style).title(" ENTER NPUB IDENTITY "));
-            f.render_widget(input, chunks[1]);
+            f.render_widget(input, chunks[2]);
         }
         AppState::Connecting => {
              let loading = Paragraph::new("DECRYPTING REALITY...")
                 .style(Style::default().fg(CYBER_GREEN).add_modifier(Modifier::RAPID_BLINK))
                 .block(Block::default().borders(Borders::ALL).border_style(border_style));
-             f.render_widget(loading, chunks[1]);
+             f.render_widget(loading, chunks[2]);
         }
         AppState::Feed => {
             // Calculate available width for text
-            // Chunks[1] width - 2 (borders) - 2 (left/right padding if any, let's say 2 for safety)
-            let max_width = chunks[1].width.saturating_sub(4) as usize;
+            // Chunks[2] width - 2 (borders) - 2 (left/right padding if any, let's say 2 for safety)
+            let max_width = chunks[2].width.saturating_sub(4) as usize;
 
             let messages: Vec<ListItem> = app.messages
                 .iter()
@@ -365,7 +456,7 @@ fn ui(f: &mut Frame, app: &App) {
             let mut state = ratatui::widgets::ListState::default();
             state.select(Some(app.scroll));
             
-            f.render_stateful_widget(messages_list, chunks[1], &mut state);
+            f.render_stateful_widget(messages_list, chunks[2], &mut state);
         }
     }
 
@@ -373,5 +464,5 @@ fn ui(f: &mut Frame, app: &App) {
     let status = Paragraph::new(app.status.as_str())
         .style(Style::default().fg(Color::White).bg(Color::Rgb(20, 20, 30)))
         .block(Block::default().borders(Borders::ALL).border_style(border_style).title(" SYSTEM STATUS "));
-    f.render_widget(status, chunks[2]);
+    f.render_widget(status, chunks[3]);
 }

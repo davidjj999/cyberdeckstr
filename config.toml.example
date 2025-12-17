@@ -1,0 +1,4 @@
+npub = "npub1..."
+node_username = "user"
+node_password = "password"
+node_address = "127.0.0.1:8332"

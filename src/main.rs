@@ -45,6 +45,11 @@ struct MarketChart {
     prices: Vec<(f64, f64)>,
 }
 
+#[derive(Deserialize)]
+struct Config {
+    npub: Option<String>,
+}
+
 impl App {
     fn new() -> App {
         App {
@@ -69,7 +74,40 @@ async fn main() -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     // Create App state
-    let app = Arc::new(Mutex::new(App::new()));
+    let mut app_state = App::new();
+
+    // Try to load config
+    if let Ok(config_str) = std::fs::read_to_string("config.toml") {
+        if let Ok(config) = toml::from_str::<Config>(&config_str) {
+            if let Some(npub) = config.npub {
+                 if !npub.is_empty() {
+                     app_state.input = npub.clone();
+                     app_state.state = AppState::Connecting;
+                     app_state.status = "Initializing Uplink...".to_string();
+                 }
+            }
+        }
+    }
+
+    let app = Arc::new(Mutex::new(app_state));
+
+
+    // Channel for conveying events from the Nostr client task to the UI
+    let (tx, rx) = mpsc::channel::<String>(100);
+
+    // Auto-connect if configured
+    {
+        let guard = app.lock().await;
+        if let AppState::Connecting = guard.state {
+             let npub = guard.input.clone();
+             let app_clone = app.clone();
+             let tx_clone = tx.clone();
+             tokio::spawn(async move {
+                 if let Err(_e) = connect_nostr(npub, app_clone, tx_clone).await {
+                 }
+             });
+        }
+    }
 
     // Spawn BTC data fetcher
     let app_btc = app.clone();
@@ -77,8 +115,6 @@ async fn main() -> Result<()> {
         fetch_btc_data(app_btc).await;
     });
 
-    // Channel for conveying events from the Nostr client task to the UI
-    let (tx, rx) = mpsc::channel::<String>(100);
 
     // Main loop
     let res = run_app(&mut terminal, app.clone(), tx, rx).await;

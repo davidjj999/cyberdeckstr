@@ -637,7 +637,7 @@ fn ui(f: &mut Frame, app: &App) {
         
         // 2. Blockchain Viz
         let viz_area = chunks[2];
-        let vz_block = Block::default().borders(Borders::ALL).border_style(border_style).title(" BITCOIN MAINNET ");
+        let vz_block = Block::default().borders(Borders::ALL).border_style(border_style).title(format!(" BITCOIN MAINNET - {} ", app.node_status));
         f.render_widget(vz_block, viz_area);
         
         let inner_area = viz_area.inner(ratatui::layout::Margin { vertical: 1, horizontal: 1 });

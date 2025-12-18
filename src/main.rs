@@ -309,9 +309,10 @@ async fn connect_nostr(npub_str: String, app: Arc<Mutex<App>>, tx: mpsc::Sender<
     // 2. Create client (Ephemeral / Read Only)
     let client = Client::default();
     
-    // 3. Add relays
+    // 3. Add bootstrap relays
     client.add_relay("wss://relay.damus.io").await?;
     client.add_relay("wss://nos.lol").await?;
+    client.add_relay("wss://relay.primal.net").await?;
     
     // 4. Connect
     {
@@ -341,6 +342,58 @@ async fn connect_nostr(npub_str: String, app: Arc<Mutex<App>>, tx: mpsc::Sender<
     
     // Add self to follows to see own notes if any
     follows.push(public_key);
+
+    // --- RELAY OPTIMIZATION ---
+    if !follows.is_empty() {
+        {
+            let mut app_guard = app.lock().await;
+            app_guard.status = "DISCOVERING RELAYS...".to_string();
+        }
+        
+        // Fetch RealmList (10002) for all follows
+        // Splitting into chunks to avoid potential filter limits, though fetching 10002 usually is fast.
+        let relay_filter = Filter::new().kind(Kind::RelayList).authors(follows.clone());
+        let relay_events = client.fetch_events(relay_filter, Duration::from_secs(6)).await.unwrap_or_default();
+        
+        let mut relay_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        
+        for event in relay_events {
+             for tag in event.tags.iter() {
+                 let s = tag.as_slice();
+                 if s.len() >= 2 && s[0] == "r" {
+                     // Normalize URL lightly?
+                     let url = s[1].trim_end_matches('/').to_string();
+                     *relay_counts.entry(url).or_insert(0) += 1;
+                 }
+             }
+        }
+        
+        // Ranking
+        let mut ranked_relays: Vec<(String, usize)> = relay_counts.into_iter().collect();
+        ranked_relays.sort_by(|a, b| b.1.cmp(&a.1)); // Descending count
+        
+        let top_k = 5;
+        let top_relays: Vec<String> = ranked_relays.iter().take(top_k).map(|(r, _)| r.clone()).collect();
+        
+        if !top_relays.is_empty() {
+             {
+                let mut app_guard = app.lock().await;
+                app_guard.status = format!("OPTIMIZING UPLINK ({} RELAYS)...", top_relays.len());
+             }
+             
+             for url in top_relays {
+                 // Add relay if not exists
+                 client.add_relay(url).await.ok(); 
+             }
+             
+             // Re-connect to ensure new relays are active
+             client.connect().await;
+             
+             // Give it a moment to stabilize
+             tokio::time::sleep(Duration::from_millis(1500)).await;
+        }
+    }
+    // --------------------------
 
     // Fetch Metadata for follows to resolve names
     let mut author_map = std::collections::HashMap::new();

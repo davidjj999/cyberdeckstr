@@ -537,6 +537,9 @@ fn ui(f: &mut Frame, app: &App) {
     let text_style = Style::default().fg(CYBER_GREEN).bg(CYBER_BLACK);
     let highlight_style = Style::default().fg(CYBER_CYAN).add_modifier(Modifier::BOLD);
 
+    // 1. Fill background to unify color (Black/Grey issue)
+    f.render_widget(Block::default().style(Style::default().bg(CYBER_BLACK)), size);
+
     let constraints = if app.bitcoin_node_configured {
         vec![
             Constraint::Length(3),  // Header
@@ -763,7 +766,7 @@ fn ui(f: &mut Frame, app: &App) {
     // Footer / Status
     let status_chunk_index = if app.bitcoin_node_configured { 4 } else { 3 };
     let status = Paragraph::new(app.status.as_str())
-        .style(Style::default().fg(Color::White).bg(Color::Rgb(20, 20, 30)))
+        .style(Style::default().fg(Color::White).bg(CYBER_BLACK))
         .block(Block::default().borders(Borders::ALL).border_style(border_style).title(" SYSTEM STATUS "));
     f.render_widget(status, chunks[status_chunk_index]);
 }

@@ -116,17 +116,23 @@ async fn run_app<B: Backend>(
     tx: mpsc::Sender<String>,
     mut rx: mpsc::Receiver<String>,
 ) -> Result<()> {
-    // Input polling interval
-    let mut interval = tokio::time::interval(Duration::from_millis(100));
+    // Input polling interval - 60fps for responsiveness
+    let mut input_interval = tokio::time::interval(Duration::from_millis(16));
+    // Render interval - 30fps limit
+    let mut render_interval = tokio::time::interval(Duration::from_millis(33));
+
+    // Set missed tick behavior to skip to avoid bursts
+    input_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    render_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
-        {
-            let app_guard = app.lock().await;
-            terminal.draw(|f| ui(f, &app_guard))?;
-        }
-
         tokio::select! {
-             _ = interval.tick() => {
+             _ = render_interval.tick() => {
+                 let app_guard = app.lock().await;
+                 terminal.draw(|f| ui(f, &app_guard))?;
+             }
+             
+             _ = input_interval.tick() => {
                  // Check for terminal events
                  if event::poll(Duration::from_millis(0))? {
                      if let Event::Key(key) = event::read()? {
@@ -188,6 +194,7 @@ async fn run_app<B: Backend>(
                      }
                  }
              }
+             
              Some(msg) = rx.recv() => {
                  let mut app_guard = app.lock().await;
                  app_guard.messages.push(msg);

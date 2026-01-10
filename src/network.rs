@@ -5,7 +5,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use bitcoincore_rpc::{Auth, Client as BtcClient, RpcApi};
 
-pub async fn connect_nostr(npub_str: String, app: SharedApp, tx: mpsc::Sender<String>) -> Result<()> {
+pub async fn connect_nostr(npub_str: String, app: SharedApp, tx: mpsc::Sender<(String, String)>) -> Result<()> {
     // 1. Parse keys
     let public_key = match PublicKey::parse(&npub_str) {
         Ok(pk) => pk,
@@ -158,7 +158,7 @@ pub async fn connect_nostr(npub_str: String, app: SharedApp, tx: mpsc::Sender<St
                 });
                 
                 let display = format!("@{}: {}", author_name, content); 
-                tx.send(display).await.ok();
+                tx.send((event.id.to_string(), display)).await.ok();
             }
         }
     }

@@ -68,7 +68,7 @@ async fn main() -> Result<()> {
     }
 
     // Channel for conveying events from the Nostr client task to the UI
-    let (tx, rx) = mpsc::channel::<String>(100);
+    let (tx, rx) = mpsc::channel::<(String, String)>(100);
 
     // Auto-connect if configured
     {
@@ -113,8 +113,8 @@ async fn main() -> Result<()> {
 async fn run_app<B: Backend>(
     terminal: &mut Terminal<B>,
     app: Arc<Mutex<App>>,
-    tx: mpsc::Sender<String>,
-    mut rx: mpsc::Receiver<String>,
+    tx: mpsc::Sender<(String, String)>,
+    mut rx: mpsc::Receiver<(String, String)>,
 ) -> Result<()> {
     // Input polling interval - 60fps for responsiveness
     let mut input_interval = tokio::time::interval(Duration::from_millis(16));
@@ -195,12 +195,15 @@ async fn run_app<B: Backend>(
                  }
              }
              
-             Some(msg) = rx.recv() => {
+             Some((id, msg)) = rx.recv() => {
                  let mut app_guard = app.lock().await;
-                 app_guard.messages.push(msg);
-                 // Auto-scroll if at bottom
-                 if app_guard.messages.len() > 0 {
-                      app_guard.scroll = app_guard.messages.len() - 1;
+                 if !app_guard.seen_ids.contains(&id) {
+                     app_guard.seen_ids.insert(id);
+                     app_guard.messages.push(msg);
+                     // Auto-scroll if at bottom
+                     if app_guard.messages.len() > 0 {
+                          app_guard.scroll = app_guard.messages.len() - 1;
+                     }
                  }
              }
         }

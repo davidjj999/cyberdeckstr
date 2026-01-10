@@ -24,6 +24,7 @@ pub struct App {
     pub blocks: Vec<BlockDisplayInfo>,
     pub mempool: MempoolDisplayInfo,
     pub fees: FeeDisplayInfo,
+    pub seen_ids: std::collections::HashSet<String>,
 }
 
 #[derive(Clone)]
@@ -80,6 +81,7 @@ impl App {
             blocks: Vec::new(),
             mempool: MempoolDisplayInfo::default(),
             fees: FeeDisplayInfo::default(),
+            seen_ids: std::collections::HashSet::new(),
         }
     }
 }

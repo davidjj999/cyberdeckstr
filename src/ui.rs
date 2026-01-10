@@ -216,7 +216,7 @@ pub fn ui(f: &mut Frame, app: &App) {
         }
         AppState::Feed => {
             // Calculate available width for text
-            let max_width = chunks[content_chunk_index].width.saturating_sub(4) as usize;
+            let max_width = chunks[content_chunk_index].width.saturating_sub(6) as usize;
 
             let messages: Vec<ListItem> = app.messages
                 .iter()
@@ -235,7 +235,7 @@ pub fn ui(f: &mut Frame, app: &App) {
                 .collect();
                 
             let messages_list = List::new(messages)
-                .block(Block::default().borders(Borders::ALL).border_style(border_style).title(" LIVE FEED "))
+                .block(Block::default().borders(Borders::ALL).border_style(border_style).title(" LIVE FEED ").style(Style::default().bg(CYBER_BLACK)))
                 .highlight_style(highlight_style); 
 
             let mut state = ratatui::widgets::ListState::default();

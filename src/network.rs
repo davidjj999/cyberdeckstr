@@ -142,32 +142,109 @@ pub async fn connect_nostr(npub_str: String, app: SharedApp, tx: mpsc::Sender<(S
         app_guard.state = AppState::Feed;
         app_guard.status = "CONNECTED. SIGNAL ACQUIRED.".to_string();
         app_guard.client = Some(client.clone());
+        app_guard.dirty = true;
     }
 
-    // 7. Handle Notifications
+    // 7. Handle Notifications with health check for suspend/resume scenarios
     let mut notifications = client.notifications();
-    while let Ok(notification) = notifications.recv().await {
-        if let RelayPoolNotification::Event { event, .. } = notification {
-            if event.kind == Kind::TextNote {
-                let content = clean_content(&event.content);
-                // Get author display name
-                let author_name = author_map.get(&event.pubkey).cloned().unwrap_or_else(|| {
-                     // Initial chars of pubkey
-                     let pk_str = event.pubkey.to_string();
-                     format!("{}...", &pk_str[0..8])
-                });
+    
+    // Health check parameters
+    const HEALTH_CHECK_INTERVAL_SECS: u64 = 120; // Check every 2 minutes
+    const RECONNECT_TIMEOUT_SECS: u64 = 180; // Reconnect if no data for 3 minutes
+    
+    let mut last_data_time = std::time::Instant::now();
+    let mut health_check_interval = tokio::time::interval(Duration::from_secs(HEALTH_CHECK_INTERVAL_SECS));
+    health_check_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    
+    loop {
+        tokio::select! {
+            result = notifications.recv() => {
+                match result {
+                    Ok(notification) => {
+                        last_data_time = std::time::Instant::now();
+                        
+                        if let RelayPoolNotification::Event { event, .. } = notification {
+                            if event.kind == Kind::TextNote {
+                                let content = clean_content(&event.content);
+                                // Get author display name
+                                let author_name = author_map.get(&event.pubkey).cloned().unwrap_or_else(|| {
+                                     // Initial chars of pubkey
+                                     let pk_str = event.pubkey.to_string();
+                                     format!("{}...", &pk_str[0..8])
+                                });
+                                
+                                let display = format!("@{}: {}", author_name, content); 
+                                tx.send((event.id.to_string(), display)).await.ok();
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        // Channel closed or error - attempt reconnection
+                        {
+                            let mut app_guard = app.lock().await;
+                            app_guard.status = "CONNECTION LOST. RECONNECTING...".to_string();
+                            app_guard.dirty = true;
+                        }
+                        
+                        // Attempt to reconnect
+                        client.disconnect().await;
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        client.connect().await;
+                        
+                        // Re-subscribe after reconnect
+                        notifications = client.notifications();
+                        
+                        {
+                            let mut app_guard = app.lock().await;
+                            app_guard.status = "RECONNECTED. SIGNAL ACQUIRED.".to_string();
+                            app_guard.dirty = true;
+                        }
+                        
+                        last_data_time = std::time::Instant::now();
+                    }
+                }
+            }
+            
+            _ = health_check_interval.tick() => {
+                // Check if we've received data recently
+                let elapsed = last_data_time.elapsed().as_secs();
                 
-                let display = format!("@{}: {}", author_name, content); 
-                tx.send((event.id.to_string(), display)).await.ok();
+                if elapsed > RECONNECT_TIMEOUT_SECS {
+                    // No data for too long - likely stale connection after suspend/resume
+                    {
+                        let mut app_guard = app.lock().await;
+                        app_guard.status = "STALE CONNECTION DETECTED. RECONNECTING...".to_string();
+                        app_guard.dirty = true;
+                    }
+                    
+                    // Force reconnection
+                    client.disconnect().await;
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    client.connect().await;
+                    
+                    // Re-acquire notifications channel
+                    notifications = client.notifications();
+                    
+                    {
+                        let mut app_guard = app.lock().await;
+                        app_guard.status = "RECONNECTED. SIGNAL ACQUIRED.".to_string();
+                        app_guard.dirty = true;
+                    }
+                    
+                    last_data_time = std::time::Instant::now();
+                }
             }
         }
     }
-
-    Ok(())
 }
 
 pub async fn fetch_btc_data(app: SharedApp) {
-    let client = reqwest::Client::new();
+    // Create client once for connection pooling efficiency
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+    
     loop {
          // Fetch last 24 hours (1 day)
          let url = "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart?vs_currency=usd&days=1";
@@ -176,6 +253,7 @@ pub async fn fetch_btc_data(app: SharedApp) {
                  if let Ok(chart_data) = resp.json::<MarketChart>().await {
                      let mut app_guard = app.lock().await;
                      app_guard.btc_history = chart_data.prices;
+                     app_guard.dirty = true;
                  }
              }
              Err(_e) => { 
@@ -194,9 +272,8 @@ pub fn clean_content(input: &str) -> String {
 }
 
 pub async fn fetch_blockchain_data(app: SharedApp, url: String, user: String, pass: String) {
-    // bitcoincore-rpc is blocking, so we use spawn_blocking inside the loop or just run in this task?
+    // bitcoincore-rpc is blocking, so we use spawn_blocking inside the loop
     // Since this is a tokio::spawn'd task, we shouldn't block the thread.
-    // Ideally we wrap the RPC calls.
     
     // Construct the full URL with auth if not present in string
     // bitcoincore-rpc expects "http://host:port" and separate Auth
@@ -208,12 +285,13 @@ pub async fn fetch_blockchain_data(app: SharedApp, url: String, user: String, pa
 
     let auth = Auth::UserPass(user, pass);
     
+    // Exponential backoff parameters
+    const BASE_DELAY_SECS: u64 = 5;
+    const MAX_DELAY_SECS: u64 = 60;
+    let mut consecutive_failures: u32 = 0;
+    
     // Attempt connection loop
     loop {
-        // We create client each time or reuse? Client is cheap?
-        // Reuse client is better but need to handle potential disconnects?
-        // bitcoincore_rpc::Client doesn't hold a persistent connection usually, it's HTTP.
-        
         let client_url = rpc_url.clone();
         let client_auth = auth.clone();
 
@@ -232,11 +310,7 @@ pub async fn fetch_blockchain_data(app: SharedApp, url: String, user: String, pa
              for _ in 0..6 {
                  let block = client.get_block(&current_hash).map_err(|e| e.to_string())?;
                  blocks.push(BlockDisplayInfo {
-                     height: 0, // We don't get height directly from get_block easily without header? 
-                     // Wait, get_block returns Block which has header. Header doesn't have height.
-                     // But we know best_height.
-                     // It's simpler to fetch block hash by height?
-                     // Let's use get_block_hash(height)
+                     height: 0,
                      size: block.total_size(),
                      timestamp: block.header.time as u64,
                      tx_count: block.txdata.len(),
@@ -258,7 +332,6 @@ pub async fn fetch_blockchain_data(app: SharedApp, url: String, user: String, pa
              };
              
              // 4. Smart Fee
-             
              let f_low = client.estimate_smart_fee(144, None).ok().and_then(|r| r.fee_rate).map(|a| a.to_btc() * 100_000.0).unwrap_or(0.0);
              let f_med = client.estimate_smart_fee(6, None).ok().and_then(|r| r.fee_rate).map(|a| a.to_btc() * 100_000.0).unwrap_or(0.0);
              let f_high = client.estimate_smart_fee(1, None).ok().and_then(|r| r.fee_rate).map(|a| a.to_btc() * 100_000.0).unwrap_or(0.0);
@@ -272,24 +345,34 @@ pub async fn fetch_blockchain_data(app: SharedApp, url: String, user: String, pa
              Ok((blocks, mempool, fees))
         }).await;
         
-        match res {
+        let delay_secs = match res {
             Ok(Ok((blocks, mempool, fees))) => {
                  let mut app_guard = app.lock().await;
                  app_guard.blocks = blocks;
                  app_guard.mempool = mempool;
                  app_guard.fees = fees;
                  app_guard.node_status = "NODE CONNECTED".to_string();
+                 app_guard.dirty = true;
+                 consecutive_failures = 0;
+                 BASE_DELAY_SECS // Normal polling interval on success
             }
             Ok(Err(e)) => {
                  let mut app_guard = app.lock().await;
                  app_guard.node_status = format!("NODE ERROR: {}", e);
+                 app_guard.dirty = true;
+                 consecutive_failures = consecutive_failures.saturating_add(1);
+                 // Exponential backoff: 5, 10, 20, 40, 60 (capped)
+                 std::cmp::min(BASE_DELAY_SECS * 2u64.pow(consecutive_failures.min(4)), MAX_DELAY_SECS)
             }
             Err(e) => {
                  let mut app_guard = app.lock().await;
                  app_guard.node_status = format!("TASK ERROR: {}", e);
+                 app_guard.dirty = true;
+                 consecutive_failures = consecutive_failures.saturating_add(1);
+                 std::cmp::min(BASE_DELAY_SECS * 2u64.pow(consecutive_failures.min(4)), MAX_DELAY_SECS)
             }
-        }
+        };
         
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        tokio::time::sleep(Duration::from_secs(delay_secs)).await;
     }
 }

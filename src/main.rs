@@ -116,96 +116,117 @@ async fn run_app<B: Backend>(
     tx: mpsc::Sender<(String, String)>,
     mut rx: mpsc::Receiver<(String, String)>,
 ) -> Result<()> {
-    // Input polling interval - 60fps for responsiveness
-    let mut input_interval = tokio::time::interval(Duration::from_millis(16));
-    // Render interval - 30fps limit
-    let mut render_interval = tokio::time::interval(Duration::from_millis(33));
+    // Adaptive polling: start with normal interval, slow down when idle
+    const ACTIVE_POLL_MS: u64 = 50;    // 20fps when active
+    const IDLE_POLL_MS: u64 = 200;     // 5fps when idle
+    const IDLE_THRESHOLD_MS: u64 = 5000; // Consider idle after 5 seconds of no activity
 
-    // Set missed tick behavior to skip to avoid bursts
-    input_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    render_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut last_activity = std::time::Instant::now();
+    let mut last_render = std::time::Instant::now();
+    
+    // Minimum render interval to cap at ~30fps
+    let min_render_interval = Duration::from_millis(33);
 
     loop {
+        // Calculate current poll timeout based on activity
+        let idle_duration = last_activity.elapsed().as_millis() as u64;
+        let poll_timeout = if idle_duration > IDLE_THRESHOLD_MS {
+            Duration::from_millis(IDLE_POLL_MS)
+        } else {
+            Duration::from_millis(ACTIVE_POLL_MS)
+        };
+
         tokio::select! {
-             _ = render_interval.tick() => {
-                 let app_guard = app.lock().await;
-                 terminal.draw(|f| ui(f, &app_guard))?;
-             }
-             
-             _ = input_interval.tick() => {
-                 // Check for terminal events
-                 if event::poll(Duration::from_millis(0))? {
-                     if let Event::Key(key) = event::read()? {
-                         let mut app_guard = app.lock().await;
-                         match app_guard.state {
-                             AppState::Login => {
-                                 match key.code {
-                                     KeyCode::Enter => {
-                                         let npub = app_guard.input.clone();
-                                         app_guard.state = AppState::Connecting;
-                                         app_guard.status = "Initializing Uplink...".to_string();
-                                         
-                                         // Spawn connection task
-                                         let app_clone = app.clone();
-                                         let tx_clone = tx.clone();
-                                         tokio::spawn(async move {
-                                             if let Err(_e) = connect_nostr(npub, app_clone, tx_clone).await {
-                                                 // Log error to console - this might mess up TUI if not careful
-                                                 // But we are in a spawned task.
+            // Handle terminal input events with adaptive timeout
+            _ = tokio::time::sleep(poll_timeout) => {
+                // Check for terminal events with non-blocking poll
+                if event::poll(Duration::from_millis(0))? {
+                    if let Event::Key(key) = event::read()? {
+                        last_activity = std::time::Instant::now();
+                        let mut app_guard = app.lock().await;
+                        app_guard.mark_dirty();
+                        
+                        match app_guard.state {
+                            AppState::Login => {
+                                match key.code {
+                                    KeyCode::Enter => {
+                                        let npub = app_guard.input.clone();
+                                        app_guard.state = AppState::Connecting;
+                                        app_guard.status = "Initializing Uplink...".to_string();
+                                        
+                                        // Spawn connection task
+                                        let app_clone = app.clone();
+                                        let tx_clone = tx.clone();
+                                        tokio::spawn(async move {
+                                            if let Err(_e) = connect_nostr(npub, app_clone, tx_clone).await {
+                                                // Error handled inside connect_nostr
+                                            }
+                                        });
+                                    }
+                                    KeyCode::Char(c) => {
+                                        app_guard.input.push(c);
+                                    }
+                                    KeyCode::Backspace => {
+                                        app_guard.input.pop();
+                                    }
+                                    KeyCode::Esc => {
+                                        return Ok(());
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            AppState::Connecting => {
+                                if key.code == KeyCode::Esc {
+                                     return Ok(());
+                                }
+                            }
+                            AppState::Feed => {
+                                match key.code {
+                                    KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+                                    KeyCode::Down => {
+                                         if !app_guard.messages.is_empty() {
+                                             if app_guard.scroll < app_guard.messages.len() - 1 {
+                                                 app_guard.scroll += 1;
                                              }
-                                         });
-                                     }
-                                     KeyCode::Char(c) => {
-                                         app_guard.input.push(c);
-                                     }
-                                     KeyCode::Backspace => {
-                                         app_guard.input.pop();
-                                     }
-                                     KeyCode::Esc => {
-                                         return Ok(());
-                                     }
-                                     _ => {}
-                                 }
-                             }
-                             AppState::Connecting => {
-                                 if key.code == KeyCode::Esc {
-                                      return Ok(());
-                                 }
-                             }
-                             AppState::Feed => {
-                                 match key.code {
-                                     KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
-                                     KeyCode::Down => {
-                                          if !app_guard.messages.is_empty() {
-                                              if app_guard.scroll < app_guard.messages.len() - 1 {
-                                                  app_guard.scroll += 1;
-                                              }
-                                          }
-                                     }
-                                     KeyCode::Up => {
-                                         if app_guard.scroll > 0 {
-                                             app_guard.scroll -= 1;
                                          }
-                                     }
-                                     _ => {}
-                                 }
-                             }
-                         }
-                     }
-                 }
-             }
-             
-             Some((id, msg)) = rx.recv() => {
-                 let mut app_guard = app.lock().await;
-                 if !app_guard.seen_ids.contains(&id) {
-                     app_guard.seen_ids.insert(id);
-                     app_guard.messages.push(msg);
-                     // Auto-scroll if at bottom
-                     if app_guard.messages.len() > 0 {
-                          app_guard.scroll = app_guard.messages.len() - 1;
-                     }
-                 }
-             }
+                                    }
+                                    KeyCode::Up => {
+                                        if app_guard.scroll > 0 {
+                                            app_guard.scroll -= 1;
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            
+            // Handle incoming Nostr messages
+            Some((id, msg)) = rx.recv() => {
+                last_activity = std::time::Instant::now();
+                let mut app_guard = app.lock().await;
+                app_guard.add_message(id, msg);
+            }
+        }
+
+        // Event-driven rendering: only render when dirty and enough time has passed
+        let should_render = {
+            let mut app_guard = app.lock().await;
+            let has_passed = last_render.elapsed() >= min_render_interval;
+            if has_passed && app_guard.consume_dirty() {
+                true
+            } else {
+                false
+            }
+        };
+
+        if should_render {
+            let app_guard = app.lock().await;
+            terminal.draw(|f| ui(f, &app_guard))?;
+            last_render = std::time::Instant::now();
         }
     }
 }
+

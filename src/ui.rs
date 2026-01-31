@@ -139,12 +139,14 @@ pub fn ui(f: &mut Frame, app: &App) {
             .direction(Direction::Horizontal)
             .constraints(block_constraints)
             .split(viz_rows[0]);
+        
+        // Get current time once per frame instead of per block
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
             
         for (i, block) in app.blocks.iter().enumerate() {
              if i >= 6 { break; }
              
-             // Time diff
-             let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+             // Time diff (using cached 'now')
              let diff = now.saturating_sub(block.timestamp);
              let time_str = if diff < 60 { format!("{}s", diff) } else { format!("{}m", diff / 60) };
              

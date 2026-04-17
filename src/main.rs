@@ -1,6 +1,8 @@
 mod app;
+mod bitcoin;
 mod config;
-mod network;
+mod market;
+mod nostr;
 mod ui;
 
 use anyhow::Result;
@@ -13,88 +15,112 @@ use ratatui::{
     backend::{Backend, CrosstermBackend},
     Terminal,
 };
-use std::{io, sync::Arc, time::Duration};
+use std::{io, time::Duration};
 use tokio::sync::mpsc;
-use tokio::sync::Mutex;
 
-use app::{App, AppState};
+use app::{App, AppMessage, AppState, NodeState};
 use config::Config;
-use network::{connect_nostr, fetch_blockchain_data, fetch_btc_data};
-use ui::ui;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // TUI setup
+    // -----------------------------------------------------------------------
+    // 1. Structured logging to file (safe for TUI — never writes to stdout)
+    // -----------------------------------------------------------------------
+    let file_appender = tracing_appender::rolling::daily("logs", "cyberdeckstr.log");
+    let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
+    tracing_subscriber::fmt()
+        .with_writer(non_blocking)
+        .with_ansi(false)
+        .init();
+
+    tracing::info!("CYBERDECKSTR starting up");
+
+    // -----------------------------------------------------------------------
+    // 2. Panic hook — restore terminal before printing backtrace
+    // -----------------------------------------------------------------------
+    let original_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = disable_raw_mode();
+        let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
+        original_hook(info);
+    }));
+
+    // -----------------------------------------------------------------------
+    // 3. TUI setup
+    // -----------------------------------------------------------------------
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    // Create App state
-    let mut app_state = App::new();
+    // -----------------------------------------------------------------------
+    // 4. App state — owned exclusively by the main loop (no Arc<Mutex>)
+    // -----------------------------------------------------------------------
+    let mut app = App::new();
 
-    // Try to load config
-    let mut node_config = (None, None, None); // url, user, pass
+    // Single channel: all background tasks send AppMessage here
+    let (tx, rx) = mpsc::channel::<AppMessage>(256);
 
+    // -----------------------------------------------------------------------
+    // 5. Load config and spawn background tasks
+    // -----------------------------------------------------------------------
     if let Ok(config_str) = std::fs::read_to_string("config.toml") {
-        if let Ok(config) = toml::from_str::<Config>(&config_str) {
-            if let Some(npub) = config.npub {
-                 if !npub.is_empty() {
-                     app_state.input = npub.clone();
-                     app_state.state = AppState::Connecting;
-                     app_state.status = "Initializing Uplink...".to_string();
-                 }
-            }
-            // Check for node config
-            if let (Some(addr), Some(user), Some(pass)) = (config.node_address, config.node_username, config.node_password) {
-                if !addr.is_empty() && !user.is_empty() && !pass.is_empty() {
-                    app_state.bitcoin_node_configured = true;
-                    app_state.node_status = "CONNECTING TO NODE...".to_string();
-                    node_config = (Some(addr), Some(user), Some(pass));
+        match toml::from_str::<Config>(&config_str) {
+            Ok(config) => {
+                tracing::info!("Configuration loaded successfully");
+
+                // Bitcoin node data fetcher
+                if let (Some(addr), Some(user), Some(pass)) =
+                    (config.node_address, config.node_username, config.node_password)
+                {
+                    if !addr.is_empty() && !user.is_empty() && !pass.is_empty() {
+                        app.node = Some(NodeState::new());
+                        let tx_btc = tx.clone();
+                        tokio::spawn(async move {
+                            bitcoin::fetch_blockchain_data(tx_btc, addr, user, pass).await;
+                        });
+                        tracing::info!("Bitcoin node data fetcher spawned");
+                    }
+                }
+
+                // Auto-connect Nostr if npub is configured
+                if let Some(npub) = config.npub {
+                    if !npub.is_empty() {
+                        app.input = npub.clone();
+                        app.state = AppState::Connecting;
+                        app.status = "Initializing Uplink...".to_string();
+
+                        let tx_nostr = tx.clone();
+                        tokio::spawn(async move {
+                            nostr::connect_nostr(npub, tx_nostr).await;
+                        });
+                        tracing::info!("Nostr auto-connect spawned");
+                    }
                 }
             }
+            Err(e) => {
+                tracing::warn!("Failed to parse config.toml: {}", e);
+            }
         }
+    } else {
+        tracing::info!("No config.toml found, starting in login mode");
     }
 
-    let app = Arc::new(Mutex::new(app_state));
-    
-    // Spawn Blockchain Data Fetcher if configured
-    if let (Some(url), Some(user), Some(pass)) = node_config {
-        let app_btc_chain = app.clone();
-        tokio::spawn(async move {
-            fetch_blockchain_data(app_btc_chain, url, user, pass).await;
-        });
-    }
-
-    // Channel for conveying events from the Nostr client task to the UI
-    let (tx, rx) = mpsc::channel::<(String, String)>(100);
-
-    // Auto-connect if configured
-    {
-        let guard = app.lock().await;
-        if let AppState::Connecting = guard.state {
-             let npub = guard.input.clone();
-             let app_clone = app.clone();
-             let tx_clone = tx.clone();
-             tokio::spawn(async move {
-                 if let Err(_e) = connect_nostr(npub, app_clone, tx_clone).await {
-                 }
-             });
-        }
-    }
-
-    // Spawn BTC data fetcher
-    let app_btc = app.clone();
+    // BTC market price fetcher (always runs)
+    let tx_market = tx.clone();
     tokio::spawn(async move {
-        fetch_btc_data(app_btc).await;
+        market::fetch_btc_data(tx_market).await;
     });
 
+    // -----------------------------------------------------------------------
+    // 6. Main event loop
+    // -----------------------------------------------------------------------
+    let res = run_app(&mut terminal, &mut app, tx, rx).await;
 
-    // Main loop
-    let res = run_app(&mut terminal, app.clone(), tx, rx).await;
-
-    // Restore terminal
+    // -----------------------------------------------------------------------
+    // 7. Restore terminal
+    // -----------------------------------------------------------------------
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
@@ -107,28 +133,26 @@ async fn main() -> Result<()> {
         println!("{:?}", err);
     }
 
+    tracing::info!("CYBERDECKSTR shutdown complete");
     Ok(())
 }
 
 async fn run_app<B: Backend>(
     terminal: &mut Terminal<B>,
-    app: Arc<Mutex<App>>,
-    tx: mpsc::Sender<(String, String)>,
-    mut rx: mpsc::Receiver<(String, String)>,
+    app: &mut App,
+    tx: mpsc::Sender<AppMessage>,
+    mut rx: mpsc::Receiver<AppMessage>,
 ) -> Result<()> {
-    // Adaptive polling: start with normal interval, slow down when idle
-    const ACTIVE_POLL_MS: u64 = 50;    // 20fps when active
-    const IDLE_POLL_MS: u64 = 200;     // 5fps when idle
-    const IDLE_THRESHOLD_MS: u64 = 5000; // Consider idle after 5 seconds of no activity
+    // Adaptive polling: fast when active, slow when idle
+    const ACTIVE_POLL_MS: u64 = 50;     // 20fps
+    const IDLE_POLL_MS: u64 = 200;      // 5fps
+    const IDLE_THRESHOLD_MS: u64 = 5000; // idle after 5s of no activity
 
     let mut last_activity = std::time::Instant::now();
     let mut last_render = std::time::Instant::now();
-    
-    // Minimum render interval to cap at ~30fps
-    let min_render_interval = Duration::from_millis(33);
+    let min_render_interval = Duration::from_millis(33); // ~30fps cap
 
     loop {
-        // Calculate current poll timeout based on activity
         let idle_duration = last_activity.elapsed().as_millis() as u64;
         let poll_timeout = if idle_duration > IDLE_THRESHOLD_MS {
             Duration::from_millis(IDLE_POLL_MS)
@@ -139,35 +163,29 @@ async fn run_app<B: Backend>(
         tokio::select! {
             // Handle terminal input events with adaptive timeout
             _ = tokio::time::sleep(poll_timeout) => {
-                // Check for terminal events with non-blocking poll
                 if event::poll(Duration::from_millis(0))? {
                     if let Event::Key(key) = event::read()? {
                         last_activity = std::time::Instant::now();
-                        let mut app_guard = app.lock().await;
-                        app_guard.mark_dirty();
-                        
-                        match app_guard.state {
+                        app.mark_dirty();
+
+                        match app.state {
                             AppState::Login => {
                                 match key.code {
                                     KeyCode::Enter => {
-                                        let npub = app_guard.input.clone();
-                                        app_guard.state = AppState::Connecting;
-                                        app_guard.status = "Initializing Uplink...".to_string();
-                                        
-                                        // Spawn connection task
-                                        let app_clone = app.clone();
+                                        let npub = app.input.clone();
+                                        app.state = AppState::Connecting;
+                                        app.status = "Initializing Uplink...".to_string();
+
                                         let tx_clone = tx.clone();
                                         tokio::spawn(async move {
-                                            if let Err(_e) = connect_nostr(npub, app_clone, tx_clone).await {
-                                                // Error handled inside connect_nostr
-                                            }
+                                            nostr::connect_nostr(npub, tx_clone).await;
                                         });
                                     }
                                     KeyCode::Char(c) => {
-                                        app_guard.input.push(c);
+                                        app.input.push(c);
                                     }
                                     KeyCode::Backspace => {
-                                        app_guard.input.pop();
+                                        app.input.pop();
                                     }
                                     KeyCode::Esc => {
                                         return Ok(());
@@ -177,22 +195,22 @@ async fn run_app<B: Backend>(
                             }
                             AppState::Connecting => {
                                 if key.code == KeyCode::Esc {
-                                     return Ok(());
+                                    return Ok(());
                                 }
                             }
                             AppState::Feed => {
                                 match key.code {
                                     KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
                                     KeyCode::Down => {
-                                         if !app_guard.messages.is_empty() {
-                                             if app_guard.scroll < app_guard.messages.len() - 1 {
-                                                 app_guard.scroll += 1;
-                                             }
-                                         }
+                                        if !app.feed.messages.is_empty()
+                                            && app.scroll < app.feed.messages.len() - 1
+                                        {
+                                            app.scroll += 1;
+                                        }
                                     }
                                     KeyCode::Up => {
-                                        if app_guard.scroll > 0 {
-                                            app_guard.scroll -= 1;
+                                        if app.scroll > 0 {
+                                            app.scroll -= 1;
                                         }
                                     }
                                     _ => {}
@@ -202,31 +220,24 @@ async fn run_app<B: Backend>(
                     }
                 }
             }
-            
-            // Handle incoming Nostr messages
-            Some((id, msg)) = rx.recv() => {
+
+            // Handle messages from background tasks (lock-free!)
+            Some(msg) = rx.recv() => {
                 last_activity = std::time::Instant::now();
-                let mut app_guard = app.lock().await;
-                app_guard.add_message(id, msg);
+                app.handle_message(msg);
             }
         }
 
-        // Event-driven rendering: only render when dirty and enough time has passed
-        let should_render = {
-            let mut app_guard = app.lock().await;
-            let has_passed = last_render.elapsed() >= min_render_interval;
-            if has_passed && app_guard.consume_dirty() {
-                true
-            } else {
-                false
+        // Event-driven rendering: only when dirty and frame budget allows
+        if last_render.elapsed() >= min_render_interval && app.consume_dirty() {
+            // Check for terminal resize → invalidate text-wrap cache
+            let content_width = terminal.size()?.width.saturating_sub(8) as usize;
+            if content_width > 0 && content_width != app.feed.cached_wrap_width {
+                app.feed.rewrap(content_width);
             }
-        };
 
-        if should_render {
-            let app_guard = app.lock().await;
-            terminal.draw(|f| ui(f, &app_guard))?;
+            terminal.draw(|f| ui::ui(f, app))?;
             last_render = std::time::Instant::now();
         }
     }
 }
-

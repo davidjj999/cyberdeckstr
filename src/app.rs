@@ -1,8 +1,5 @@
 use nostr_sdk::prelude::*;
-use serde::Deserialize;
 use std::collections::{HashSet, VecDeque};
-use std::sync::Arc;
-use tokio::sync::Mutex;
 
 // Memory limits to prevent unbounded growth
 pub const MAX_MESSAGES: usize = 2000;
@@ -15,27 +12,195 @@ pub enum AppState {
     Feed,
 }
 
-pub struct App {
-    pub state: AppState,
-    pub input: String, // For npub login
-    pub messages: VecDeque<String>, // Bounded ring buffer for messages
-    pub status: String,
-    pub scroll: usize,
-    pub client: Option<Client>,
+// ---------------------------------------------------------------------------
+// AppMessage — all background tasks communicate through this enum
+// ---------------------------------------------------------------------------
+
+/// Messages sent from background tasks to the main loop.
+/// The main loop is the sole owner of `App`; no locks required.
+pub enum AppMessage {
+    /// A new Nostr text note to display
+    NostrEvent { id: EventId, display: String },
+    /// Status update from the Nostr connection task
+    NostrStatus(String),
+    /// Nostr connection established — transition to Feed state
+    NostrConnected,
+    /// Nostr connection error — return to Login
+    NostrLoginError(String),
+    /// Updated BTC price history from CoinGecko
+    BtcPriceUpdate(Vec<(f64, f64)>),
+    /// Updated blockchain data from Bitcoin Core
+    BlockchainUpdate {
+        blocks: Vec<BlockDisplayInfo>,
+        mempool: MempoolDisplayInfo,
+        fees: FeeDisplayInfo,
+    },
+    /// Status update from the blockchain poller
+    BlockchainStatus(String),
+}
+
+// ---------------------------------------------------------------------------
+// Sub-states
+// ---------------------------------------------------------------------------
+
+/// Cached chart axis bounds, recomputed only when price data changes.
+#[derive(Clone)]
+pub struct ChartBounds {
+    pub min_x: f64,
+    pub max_x: f64,
+    pub min_y: f64,
+    pub max_y: f64,
+}
+
+impl Default for ChartBounds {
+    fn default() -> Self {
+        ChartBounds {
+            min_x: 0.0,
+            max_x: 100.0,
+            min_y: 0.0,
+            max_y: 100.0,
+        }
+    }
+}
+
+/// Nostr feed state: messages, dedup set, and text-wrap cache.
+pub struct FeedState {
+    pub messages: VecDeque<String>,
+    pub seen_ids: HashSet<EventId>,
+    pub seen_ids_order: VecDeque<EventId>,
+    pub last_nostr_data: Option<std::time::Instant>,
+    /// Pre-wrapped message lines, kept in sync with `messages`.
+    pub wrapped_messages: VecDeque<Vec<String>>,
+    /// Terminal width the cache was built at. 0 = not yet known.
+    pub cached_wrap_width: usize,
+}
+
+impl FeedState {
+    pub fn new() -> Self {
+        FeedState {
+            messages: VecDeque::with_capacity(MAX_MESSAGES),
+            seen_ids: HashSet::with_capacity(MAX_SEEN_IDS),
+            seen_ids_order: VecDeque::with_capacity(MAX_SEEN_IDS),
+            last_nostr_data: None,
+            wrapped_messages: VecDeque::with_capacity(MAX_MESSAGES),
+            cached_wrap_width: 0,
+        }
+    }
+
+    /// Add a message. Returns `true` if it was new (not a duplicate).
+    pub fn add_message(&mut self, id: EventId, msg: String) -> bool {
+        if self.seen_ids.contains(&id) {
+            return false;
+        }
+
+        // LRU eviction on the dedup set
+        if self.seen_ids.len() >= MAX_SEEN_IDS {
+            if let Some(old_id) = self.seen_ids_order.pop_front() {
+                self.seen_ids.remove(&old_id);
+            }
+        }
+        self.seen_ids.insert(id);
+        self.seen_ids_order.push_back(id);
+
+        // Pre-wrap at the current cached width
+        let wrapped = if self.cached_wrap_width > 0 {
+            wrap_message(&msg, self.cached_wrap_width)
+        } else {
+            // Width not yet known — store raw as single-line fallback
+            vec![msg.clone()]
+        };
+
+        // Ring buffer eviction
+        if self.messages.len() >= MAX_MESSAGES {
+            self.messages.pop_front();
+            self.wrapped_messages.pop_front();
+        }
+        self.messages.push_back(msg);
+        self.wrapped_messages.push_back(wrapped);
+
+        self.last_nostr_data = Some(std::time::Instant::now());
+        true
+    }
+
+    /// Re-wrap all messages at a new terminal width.
+    pub fn rewrap(&mut self, width: usize) {
+        if width == self.cached_wrap_width || width == 0 {
+            return;
+        }
+        self.cached_wrap_width = width;
+        self.wrapped_messages.clear();
+        for msg in &self.messages {
+            self.wrapped_messages.push_back(wrap_message(msg, width));
+        }
+    }
+}
+
+/// Wrap a single message string into display lines.
+fn wrap_message(msg: &str, max_width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    for line in msg.lines() {
+        if line.is_empty() {
+            lines.push(String::new());
+            continue;
+        }
+        for w in textwrap::wrap(line, max_width) {
+            lines.push(w.to_string());
+        }
+    }
+    lines
+}
+
+/// BTC market price state with cached chart bounds.
+pub struct MarketState {
     pub btc_history: Vec<(f64, f64)>,
-    // Blockchain Viz State
-    pub bitcoin_node_configured: bool,
-    pub node_status: String,
+    pub chart_bounds: ChartBounds,
+}
+
+impl MarketState {
+    pub fn new() -> Self {
+        MarketState {
+            btc_history: Vec::new(),
+            chart_bounds: ChartBounds::default(),
+        }
+    }
+
+    /// Replace price data and recompute axis bounds.
+    pub fn update_prices(&mut self, prices: Vec<(f64, f64)>) {
+        if prices.is_empty() {
+            self.chart_bounds = ChartBounds::default();
+        } else {
+            let min_x = prices.first().map(|(x, _)| *x).unwrap_or(0.0);
+            let max_x = prices.last().map(|(x, _)| *x).unwrap_or(100.0);
+            let min_y = prices.iter().map(|(_, y)| *y).fold(f64::INFINITY, f64::min);
+            let max_y = prices.iter().map(|(_, y)| *y).fold(f64::NEG_INFINITY, f64::max);
+            self.chart_bounds = ChartBounds { min_x, max_x, min_y, max_y };
+        }
+        self.btc_history = prices;
+    }
+}
+
+/// Bitcoin node state (present only when a node is configured).
+pub struct NodeState {
+    pub status: String,
     pub blocks: Vec<BlockDisplayInfo>,
     pub mempool: MempoolDisplayInfo,
     pub fees: FeeDisplayInfo,
-    pub seen_ids: HashSet<String>,
-    pub seen_ids_order: VecDeque<String>, // Track insertion order for LRU eviction
-    // Dirty flag for efficient rendering
-    pub dirty: bool,
-    // Last data received timestamp for health checks
-    pub last_nostr_data: Option<std::time::Instant>,
 }
+
+impl NodeState {
+    pub fn new() -> Self {
+        NodeState {
+            status: "CONNECTING TO NODE...".to_string(),
+            blocks: Vec::new(),
+            mempool: MempoolDisplayInfo::default(),
+            fees: FeeDisplayInfo::default(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Display structs for blockchain data
+// ---------------------------------------------------------------------------
 
 #[derive(Clone)]
 pub struct BlockDisplayInfo {
@@ -48,8 +213,8 @@ pub struct BlockDisplayInfo {
 #[derive(Clone)]
 pub struct MempoolDisplayInfo {
     pub size: usize,      // tx count
-    pub usage: usize,     // memory usage
-    pub max_mempool: usize, 
+    pub usage: usize,     // memory usage in bytes
+    pub max_mempool: usize,
 }
 
 impl Default for MempoolDisplayInfo {
@@ -60,7 +225,7 @@ impl Default for MempoolDisplayInfo {
 
 #[derive(Clone)]
 pub struct FeeDisplayInfo {
-    pub low: f64,    // sat/vb
+    pub low: f64,    // sat/vB
     pub medium: f64,
     pub high: f64,
 }
@@ -71,9 +236,20 @@ impl Default for FeeDisplayInfo {
     }
 }
 
-#[derive(Deserialize)]
-pub struct MarketChart {
-    pub prices: Vec<(f64, f64)>,
+// ---------------------------------------------------------------------------
+// App — top-level state, owned exclusively by the main loop
+// ---------------------------------------------------------------------------
+
+pub struct App {
+    pub state: AppState,
+    pub input: String,       // npub input on Login screen
+    pub scroll: usize,
+    pub status: String,
+    pub dirty: bool,
+
+    pub feed: FeedState,
+    pub market: MarketState,
+    pub node: Option<NodeState>,
 }
 
 impl App {
@@ -81,69 +257,81 @@ impl App {
         App {
             state: AppState::Login,
             input: String::new(),
-            messages: VecDeque::with_capacity(MAX_MESSAGES),
-            status: "Welcome to CYBERDECKSTR. Enter NPUB.".to_string(),
             scroll: 0,
-            client: None,
-            btc_history: Vec::new(),
-            bitcoin_node_configured: false,
-            node_status: "Node Disconnected".to_string(),
-            blocks: Vec::new(),
-            mempool: MempoolDisplayInfo::default(),
-            fees: FeeDisplayInfo::default(),
-            seen_ids: HashSet::with_capacity(MAX_SEEN_IDS),
-            seen_ids_order: VecDeque::with_capacity(MAX_SEEN_IDS),
+            status: "Welcome to CYBERDECKSTR. Enter NPUB.".to_string(),
             dirty: true,
-            last_nostr_data: None,
+            feed: FeedState::new(),
+            market: MarketState::new(),
+            node: None,
         }
     }
 
-    /// Add a message with bounded buffer (ring buffer behavior)
-    pub fn add_message(&mut self, id: String, msg: String) -> bool {
-        if self.seen_ids.contains(&id) {
-            return false;
-        }
+    /// Process a message from a background task.
+    pub fn handle_message(&mut self, msg: AppMessage) {
+        match msg {
+            AppMessage::NostrEvent { id, display } => {
+                // Track whether a message was evicted for scroll adjustment
+                let will_evict = self.feed.messages.len() >= MAX_MESSAGES;
+                let was_at_bottom = self.feed.messages.is_empty()
+                    || self.scroll >= self.feed.messages.len().saturating_sub(1);
 
-        // Add to seen_ids with LRU eviction
-        if self.seen_ids.len() >= MAX_SEEN_IDS {
-            if let Some(old_id) = self.seen_ids_order.pop_front() {
-                self.seen_ids.remove(&old_id);
+                if self.feed.add_message(id, display) {
+                    if will_evict && self.scroll > 0 {
+                        self.scroll = self.scroll.saturating_sub(1);
+                    }
+                    // Auto-scroll to bottom if user was already there
+                    if was_at_bottom && !self.feed.messages.is_empty() {
+                        self.scroll = self.feed.messages.len() - 1;
+                    }
+                    self.dirty = true;
+                }
+            }
+            AppMessage::NostrStatus(status) => {
+                self.status = status;
+                self.dirty = true;
+            }
+            AppMessage::NostrConnected => {
+                self.state = AppState::Feed;
+                self.status = "CONNECTED. SIGNAL ACQUIRED.".to_string();
+                self.dirty = true;
+            }
+            AppMessage::NostrLoginError(msg) => {
+                self.status = msg;
+                self.state = AppState::Login;
+                self.input.clear();
+                self.dirty = true;
+            }
+            AppMessage::BtcPriceUpdate(prices) => {
+                self.market.update_prices(prices);
+                self.dirty = true;
+            }
+            AppMessage::BlockchainUpdate { blocks, mempool, fees } => {
+                if let Some(ref mut node) = self.node {
+                    node.blocks = blocks;
+                    node.mempool = mempool;
+                    node.fees = fees;
+                    node.status = "NODE CONNECTED".to_string();
+                }
+                self.dirty = true;
+            }
+            AppMessage::BlockchainStatus(status) => {
+                if let Some(ref mut node) = self.node {
+                    node.status = status;
+                }
+                self.dirty = true;
             }
         }
-        self.seen_ids.insert(id.clone());
-        self.seen_ids_order.push_back(id);
-
-        // Add message with ring buffer eviction
-        if self.messages.len() >= MAX_MESSAGES {
-            self.messages.pop_front();
-            // Adjust scroll if needed
-            if self.scroll > 0 {
-                self.scroll = self.scroll.saturating_sub(1);
-            }
-        }
-        self.messages.push_back(msg);
-
-        // Auto-scroll to bottom
-        if !self.messages.is_empty() {
-            self.scroll = self.messages.len() - 1;
-        }
-
-        self.dirty = true;
-        self.last_nostr_data = Some(std::time::Instant::now());
-        true
     }
 
-    /// Mark UI as needing redraw
+    /// Mark UI as needing redraw.
     pub fn mark_dirty(&mut self) {
         self.dirty = true;
     }
 
-    /// Check and clear dirty flag
+    /// Check and clear dirty flag.
     pub fn consume_dirty(&mut self) -> bool {
         let was_dirty = self.dirty;
         self.dirty = false;
         was_dirty
     }
 }
-
-pub type SharedApp = Arc<Mutex<App>>;

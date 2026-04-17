@@ -223,13 +223,19 @@ pub fn ui(f: &mut Frame, app: &App) {
             let messages: Vec<ListItem> = app.messages
                 .iter()
                 .map(|m| {
-                    // Wrap the message
-                    let wrapped_lines = textwrap::wrap(m, max_width);
-                    
                     let mut lines = vec![Line::from(Span::raw(""))]; // Spacer
                     
-                    for line in wrapped_lines {
-                        lines.push(Line::from(Span::styled(line.to_string(), text_style)));
+                    // Split on newlines first, then wrap each line to avoid \n in Spans
+                    for line in m.lines() {
+                        if line.is_empty() {
+                            lines.push(Line::from(Span::styled("", text_style)));
+                            continue;
+                        }
+                        
+                        let wrapped_lines = textwrap::wrap(line, max_width);
+                        for w in wrapped_lines {
+                            lines.push(Line::from(Span::styled(w.to_string(), text_style)));
+                        }
                     }
                     
                     ListItem::new(lines)

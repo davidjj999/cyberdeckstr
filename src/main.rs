@@ -164,59 +164,65 @@ async fn run_app<B: Backend>(
             // Handle terminal input events with adaptive timeout
             _ = tokio::time::sleep(poll_timeout) => {
                 if event::poll(Duration::from_millis(0))? {
-                    if let Event::Key(key) = event::read()? {
-                        last_activity = std::time::Instant::now();
-                        app.mark_dirty();
+                    match event::read()? {
+                        Event::Key(key) => {
+                            last_activity = std::time::Instant::now();
+                            app.mark_dirty();
 
-                        match app.state {
-                            AppState::Login => {
-                                match key.code {
-                                    KeyCode::Enter => {
-                                        let npub = app.input.clone();
-                                        app.state = AppState::Connecting;
-                                        app.status = "Initializing Uplink...".to_string();
+                            match app.state {
+                                AppState::Login => {
+                                    match key.code {
+                                        KeyCode::Enter => {
+                                            let npub = app.input.clone();
+                                            app.state = AppState::Connecting;
+                                            app.status = "Initializing Uplink...".to_string();
 
-                                        let tx_clone = tx.clone();
-                                        tokio::spawn(async move {
-                                            nostr::connect_nostr(npub, tx_clone).await;
-                                        });
+                                            let tx_clone = tx.clone();
+                                            tokio::spawn(async move {
+                                                nostr::connect_nostr(npub, tx_clone).await;
+                                            });
+                                        }
+                                        KeyCode::Char(c) => {
+                                            app.input.push(c);
+                                        }
+                                        KeyCode::Backspace => {
+                                            app.input.pop();
+                                        }
+                                        KeyCode::Esc => {
+                                            return Ok(());
+                                        }
+                                        _ => {}
                                     }
-                                    KeyCode::Char(c) => {
-                                        app.input.push(c);
-                                    }
-                                    KeyCode::Backspace => {
-                                        app.input.pop();
-                                    }
-                                    KeyCode::Esc => {
+                                }
+                                AppState::Connecting => {
+                                    if key.code == KeyCode::Esc {
                                         return Ok(());
                                     }
-                                    _ => {}
                                 }
-                            }
-                            AppState::Connecting => {
-                                if key.code == KeyCode::Esc {
-                                    return Ok(());
-                                }
-                            }
-                            AppState::Feed => {
-                                match key.code {
-                                    KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
-                                    KeyCode::Down => {
-                                        if !app.feed.messages.is_empty()
-                                            && app.scroll < app.feed.messages.len() - 1
-                                        {
-                                            app.scroll += 1;
+                                AppState::Feed => {
+                                    match key.code {
+                                        KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+                                        KeyCode::Down => {
+                                            if !app.feed.messages.is_empty()
+                                                && app.scroll < app.feed.messages.len() - 1
+                                            {
+                                                app.scroll += 1;
+                                            }
                                         }
-                                    }
-                                    KeyCode::Up => {
-                                        if app.scroll > 0 {
-                                            app.scroll -= 1;
+                                        KeyCode::Up => {
+                                            if app.scroll > 0 {
+                                                app.scroll -= 1;
+                                            }
                                         }
+                                        _ => {}
                                     }
-                                    _ => {}
                                 }
                             }
                         }
+                        Event::Resize(_, _) => {
+                            app.mark_dirty();
+                        }
+                        _ => {}
                     }
                 }
             }

@@ -37,6 +37,14 @@ pub enum AppMessage {
     },
     /// Status update from the blockchain poller
     BlockchainStatus(String),
+    /// Updated system monitor stats
+    SystemStatsUpdate {
+        cpu: u8,
+        gpu: u8,
+        ram: u8,
+        vram: u8,
+        network: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -236,6 +244,15 @@ impl Default for FeeDisplayInfo {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct SystemStats {
+    pub cpu: u8,
+    pub gpu: u8,
+    pub ram: u8,
+    pub vram: u8,
+    pub network: String,
+}
+
 // ---------------------------------------------------------------------------
 // App — top-level state, owned exclusively by the main loop
 // ---------------------------------------------------------------------------
@@ -250,6 +267,7 @@ pub struct App {
     pub feed: FeedState,
     pub market: MarketState,
     pub node: Option<NodeState>,
+    pub system_stats: Option<SystemStats>,
 }
 
 impl App {
@@ -263,6 +281,7 @@ impl App {
             feed: FeedState::new(),
             market: MarketState::new(),
             node: None,
+            system_stats: None,
         }
     }
 
@@ -318,6 +337,10 @@ impl App {
                 if let Some(ref mut node) = self.node {
                     node.status = status;
                 }
+                self.dirty = true;
+            }
+            AppMessage::SystemStatsUpdate { cpu, gpu, ram, vram, network } => {
+                self.system_stats = Some(SystemStats { cpu, gpu, ram, vram, network });
                 self.dirty = true;
             }
         }

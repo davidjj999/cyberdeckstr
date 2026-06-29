@@ -27,6 +27,7 @@ struct LayoutSlots {
     blockchain_viz: Option<Rect>,
     content: Rect,
     status: Rect,
+    sys_stats: Rect,
 }
 
 fn compute_layout(area: Rect, has_node: bool) -> LayoutSlots {
@@ -37,6 +38,7 @@ fn compute_layout(area: Rect, has_node: bool) -> LayoutSlots {
             Constraint::Length(14), // Blockchain Viz
             Constraint::Min(0),    // Content
             Constraint::Length(3), // Status
+            Constraint::Length(1), // Sys Monitor Stats
         ]
     } else {
         vec![
@@ -44,6 +46,7 @@ fn compute_layout(area: Rect, has_node: bool) -> LayoutSlots {
             Constraint::Length(12), // BTC Chart
             Constraint::Min(0),    // Content
             Constraint::Length(3), // Status
+            Constraint::Length(1), // Sys Monitor Stats
         ]
     };
 
@@ -60,6 +63,7 @@ fn compute_layout(area: Rect, has_node: bool) -> LayoutSlots {
             blockchain_viz: Some(chunks[2]),
             content: chunks[3],
             status: chunks[4],
+            sys_stats: chunks[5],
         }
     } else {
         LayoutSlots {
@@ -68,6 +72,7 @@ fn compute_layout(area: Rect, has_node: bool) -> LayoutSlots {
             blockchain_viz: None,
             content: chunks[2],
             status: chunks[3],
+            sys_stats: chunks[4],
         }
     }
 }
@@ -113,6 +118,9 @@ pub fn ui(f: &mut Frame, app: &App) {
                 .title(" SYSTEM STATUS "),
         );
     f.render_widget(status, slots.status);
+
+    // -- System Monitor Stats --
+    render_sys_stats(f, slots.sys_stats, app);
 }
 
 // ---------------------------------------------------------------------------
@@ -352,4 +360,19 @@ fn render_content(
             f.render_stateful_widget(messages_list, area, &mut state);
         }
     }
+}
+
+fn render_sys_stats(f: &mut Frame, area: Rect, app: &App) {
+    let stats_str = if let Some(stats) = &app.system_stats {
+        format!(
+            "CPU {}%  GPU {}%  RAM {}%  VRAM {}%  Network {}",
+            stats.cpu, stats.gpu, stats.ram, stats.vram, stats.network
+        )
+    } else {
+        "CPU --%  GPU --%  RAM --%  VRAM --%  Network --".to_string()
+    };
+
+    let paragraph = Paragraph::new(stats_str)
+        .style(Style::default().fg(CYBER_PINK).bg(CYBER_BLACK));
+    f.render_widget(paragraph, area);
 }

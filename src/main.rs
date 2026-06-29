@@ -3,6 +3,7 @@ mod bitcoin;
 mod config;
 mod market;
 mod nostr;
+mod system_stats;
 mod ui;
 
 use anyhow::Result;
@@ -111,6 +112,12 @@ async fn main() -> Result<()> {
     let tx_market = tx.clone();
     tokio::spawn(async move {
         market::fetch_btc_data(tx_market).await;
+    });
+
+    // System monitor stats fetcher (always runs)
+    let tx_sys = tx.clone();
+    tokio::spawn(async move {
+        system_stats::monitor_system_stats(tx_sys).await;
     });
 
     // -----------------------------------------------------------------------

@@ -37,16 +37,16 @@ fn compute_layout(area: Rect, has_node: bool) -> LayoutSlots {
             Constraint::Length(10), // BTC Chart (smaller when node panel present)
             Constraint::Length(14), // Blockchain Viz
             Constraint::Min(0),    // Content
-            Constraint::Length(1), // Sys Monitor Stats
-            Constraint::Length(3), // Status
+            Constraint::Length(3), // Status Box (with stats inside)
+            Constraint::Length(1), // Status Text (at the bottom)
         ]
     } else {
         vec![
             Constraint::Length(3),  // Header
             Constraint::Length(12), // BTC Chart
             Constraint::Min(0),    // Content
-            Constraint::Length(1), // Sys Monitor Stats
-            Constraint::Length(3), // Status
+            Constraint::Length(3), // Status Box (with stats inside)
+            Constraint::Length(1), // Status Text (at the bottom)
         ]
     };
 
@@ -62,8 +62,8 @@ fn compute_layout(area: Rect, has_node: bool) -> LayoutSlots {
             chart: chunks[1],
             blockchain_viz: Some(chunks[2]),
             content: chunks[3],
-            sys_stats: chunks[4],
-            status: chunks[5],
+            status: chunks[4],
+            sys_stats: chunks[5],
         }
     } else {
         LayoutSlots {
@@ -71,8 +71,8 @@ fn compute_layout(area: Rect, has_node: bool) -> LayoutSlots {
             chart: chunks[1],
             blockchain_viz: None,
             content: chunks[2],
-            sys_stats: chunks[3],
-            status: chunks[4],
+            status: chunks[3],
+            sys_stats: chunks[4],
         }
     }
 }
@@ -108,19 +108,30 @@ pub fn ui(f: &mut Frame, app: &App) {
     // -- Content --
     render_content(f, slots.content, app, border_style, text_style, highlight_style);
 
-    // -- Status --
-    let status = Paragraph::new(app.status.as_str())
-        .style(Style::default().fg(CYBER_PINK).bg(CYBER_BLACK))
+    // -- Status Box (containing System Monitor Stats) --
+    let stats_str = if let Some(stats) = &app.system_stats {
+        format!(
+            "CPU {:>3}%  GPU {:>3}%  RAM {:>3}%  VRAM {:>3}%  Network {:>10}",
+            stats.cpu, stats.gpu, stats.ram, stats.vram, stats.network
+        )
+    } else {
+        "CPU  --%  GPU  --%  RAM  --%  VRAM  --%  Network         --".to_string()
+    };
+
+    let status_box = Paragraph::new(stats_str)
+        .style(Style::default().fg(Color::White).bg(CYBER_BLACK))
         .block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(border_style)
                 .title(" SYSTEM STATUS "),
         );
-    f.render_widget(status, slots.status);
+    f.render_widget(status_box, slots.status);
 
-    // -- System Monitor Stats --
-    render_sys_stats(f, slots.sys_stats, app);
+    // -- Status Message (at the very bottom) --
+    let status_line = Paragraph::new(app.status.as_str())
+        .style(Style::default().fg(CYBER_PINK).bg(CYBER_BLACK));
+    f.render_widget(status_line, slots.sys_stats);
 }
 
 // ---------------------------------------------------------------------------
@@ -362,17 +373,4 @@ fn render_content(
     }
 }
 
-fn render_sys_stats(f: &mut Frame, area: Rect, app: &App) {
-    let stats_str = if let Some(stats) = &app.system_stats {
-        format!(
-            "CPU {:>3}%  GPU {:>3}%  RAM {:>3}%  VRAM {:>3}%  Network {:>10}",
-            stats.cpu, stats.gpu, stats.ram, stats.vram, stats.network
-        )
-    } else {
-        "CPU  --%  GPU  --%  RAM  --%  VRAM  --%  Network         --".to_string()
-    };
 
-    let paragraph = Paragraph::new(stats_str)
-        .style(Style::default().fg(Color::White).bg(CYBER_BLACK));
-    f.render_widget(paragraph, area);
-}

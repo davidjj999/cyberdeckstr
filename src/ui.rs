@@ -365,11 +365,11 @@ fn render_content(
 fn render_sys_stats(f: &mut Frame, area: Rect, app: &App) {
     let stats_str = if let Some(stats) = &app.system_stats {
         format!(
-            "CPU {}%  GPU {}%  RAM {}%  VRAM {}%  Network {}",
+            "CPU {:>3}%  GPU {:>3}%  RAM {:>3}%  VRAM {:>3}%  Network {:>10}",
             stats.cpu, stats.gpu, stats.ram, stats.vram, stats.network
         )
     } else {
-        "CPU --%  GPU --%  RAM --%  VRAM --%  Network --".to_string()
+        "CPU  --%  GPU  --%  RAM  --%  VRAM  --%  Network         --".to_string()
     };
 
     let paragraph = Paragraph::new(stats_str)

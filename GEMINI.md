@@ -9,7 +9,7 @@ This project is **cyberdeckstr**, a high-fidelity, cyberpunk-aesthetic Nostr cli
     *   **TUI Framework:** `ratatui` with `crossterm` backend.
     *   **Nostr Protocol:** `nostr-sdk` for relay connections and event handling.
     *   **Async Runtime:** `tokio` for concurrent networking and TUI polling.
-    *   **Data Sources:** CoinGecko API (BTC price) and optional Bitcoin Core RPC (blockchain visualization).
+    *   **Data Sources:** CoinGecko API (BTC price), optional Bitcoin Core RPC (blockchain visualization), and Linux sysfs/procfs (CPU, GPU, RAM, VRAM, and Network speed).
     *   **Logging:** `tracing` with `tracing-appender` for rolling file-based logs (writes to `logs/`).
 *   **Architecture:**
     *   `src/main.rs`: Entry point, TUI initialization, panic guard, and the main event loop. Owns `App` directly (no shared-state locks).

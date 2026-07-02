@@ -5,6 +5,23 @@ use std::collections::{HashSet, VecDeque};
 pub const MAX_MESSAGES: usize = 2000;
 pub const MAX_SEEN_IDS: usize = 5000;
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum FeedEntryKind {
+    TextNote,
+    Repost,
+}
+
+/// A single entry in the Nostr feed with all metadata needed for rich rendering.
+#[derive(Clone)]
+pub struct FeedEntry {
+    pub id: EventId,
+    pub author: String,
+    pub kind: FeedEntryKind,
+    pub content: String,
+    pub is_reply: bool,
+    pub nip05: Option<String>,
+}
+
 #[derive(Clone, PartialEq)]
 pub enum AppState {
     Login,
@@ -19,8 +36,15 @@ pub enum AppState {
 /// Messages sent from background tasks to the main loop.
 /// The main loop is the sole owner of `App`; no locks required.
 pub enum AppMessage {
-    /// A new Nostr text note to display
-    NostrEvent { id: EventId, display: String },
+    /// A new Nostr event to display (text note or repost)
+    NostrEvent {
+        id: EventId,
+        author: String,
+        kind: FeedEntryKind,
+        content: String,
+        is_reply: bool,
+        nip05: Option<String>,
+    },
     /// Status update from the Nostr connection task
     NostrStatus(String),
     /// Nostr connection established — transition to Feed state
@@ -71,14 +95,14 @@ impl Default for ChartBounds {
     }
 }
 
-/// Nostr feed state: messages, dedup set, and text-wrap cache.
+/// Nostr feed state: entries, dedup set, and text-wrap cache.
 pub struct FeedState {
-    pub messages: VecDeque<String>,
+    pub entries: VecDeque<FeedEntry>,
     pub seen_ids: HashSet<EventId>,
     pub seen_ids_order: VecDeque<EventId>,
     pub last_nostr_data: Option<std::time::Instant>,
-    /// Pre-wrapped message lines, kept in sync with `messages`.
-    pub wrapped_messages: VecDeque<Vec<String>>,
+    /// Pre-wrapped content lines, kept in sync with `entries`.
+    pub wrapped_content: VecDeque<Vec<String>>,
     /// Terminal width the cache was built at. 0 = not yet known.
     pub cached_wrap_width: usize,
 }
@@ -86,18 +110,18 @@ pub struct FeedState {
 impl FeedState {
     pub fn new() -> Self {
         FeedState {
-            messages: VecDeque::with_capacity(MAX_MESSAGES),
+            entries: VecDeque::with_capacity(MAX_MESSAGES),
             seen_ids: HashSet::with_capacity(MAX_SEEN_IDS),
             seen_ids_order: VecDeque::with_capacity(MAX_SEEN_IDS),
             last_nostr_data: None,
-            wrapped_messages: VecDeque::with_capacity(MAX_MESSAGES),
+            wrapped_content: VecDeque::with_capacity(MAX_MESSAGES),
             cached_wrap_width: 0,
         }
     }
 
-    /// Add a message. Returns `true` if it was new (not a duplicate).
-    pub fn add_message(&mut self, id: EventId, msg: String) -> bool {
-        if self.seen_ids.contains(&id) {
+    /// Add an entry. Returns `true` if it was new (not a duplicate).
+    pub fn add_entry(&mut self, entry: FeedEntry) -> bool {
+        if self.seen_ids.contains(&entry.id) {
             return false;
         }
 
@@ -107,38 +131,38 @@ impl FeedState {
                 self.seen_ids.remove(&old_id);
             }
         }
-        self.seen_ids.insert(id);
-        self.seen_ids_order.push_back(id);
+        self.seen_ids.insert(entry.id);
+        self.seen_ids_order.push_back(entry.id);
 
-        // Pre-wrap at the current cached width
+        // Pre-wrap the content at the current cached width
         let wrapped = if self.cached_wrap_width > 0 {
-            wrap_message(&msg, self.cached_wrap_width)
+            wrap_message(&entry.content, self.cached_wrap_width)
         } else {
             // Width not yet known — store raw as single-line fallback
-            vec![msg.clone()]
+            vec![entry.content.clone()]
         };
 
         // Ring buffer eviction
-        if self.messages.len() >= MAX_MESSAGES {
-            self.messages.pop_front();
-            self.wrapped_messages.pop_front();
+        if self.entries.len() >= MAX_MESSAGES {
+            self.entries.pop_front();
+            self.wrapped_content.pop_front();
         }
-        self.messages.push_back(msg);
-        self.wrapped_messages.push_back(wrapped);
+        self.entries.push_back(entry);
+        self.wrapped_content.push_back(wrapped);
 
         self.last_nostr_data = Some(std::time::Instant::now());
         true
     }
 
-    /// Re-wrap all messages at a new terminal width.
+    /// Re-wrap all entry content at a new terminal width.
     pub fn rewrap(&mut self, width: usize) {
         if width == self.cached_wrap_width || width == 0 {
             return;
         }
         self.cached_wrap_width = width;
-        self.wrapped_messages.clear();
-        for msg in &self.messages {
-            self.wrapped_messages.push_back(wrap_message(msg, width));
+        self.wrapped_content.clear();
+        for entry in &self.entries {
+            self.wrapped_content.push_back(wrap_message(&entry.content, width));
         }
     }
 }
@@ -288,19 +312,20 @@ impl App {
     /// Process a message from a background task.
     pub fn handle_message(&mut self, msg: AppMessage) {
         match msg {
-            AppMessage::NostrEvent { id, display } => {
-                // Track whether a message was evicted for scroll adjustment
-                let will_evict = self.feed.messages.len() >= MAX_MESSAGES;
-                let was_at_bottom = self.feed.messages.is_empty()
-                    || self.scroll >= self.feed.messages.len().saturating_sub(1);
+            AppMessage::NostrEvent { id, author, kind, content, is_reply, nip05 } => {
+                // Track whether an entry was evicted for scroll adjustment
+                let will_evict = self.feed.entries.len() >= MAX_MESSAGES;
+                let was_at_bottom = self.feed.entries.is_empty()
+                    || self.scroll >= self.feed.entries.len().saturating_sub(1);
 
-                if self.feed.add_message(id, display) {
+                let entry = FeedEntry { id, author, kind, content, is_reply, nip05 };
+                if self.feed.add_entry(entry) {
                     if will_evict && self.scroll > 0 {
                         self.scroll = self.scroll.saturating_sub(1);
                     }
                     // Auto-scroll to bottom if user was already there
-                    if was_at_bottom && !self.feed.messages.is_empty() {
-                        self.scroll = self.feed.messages.len() - 1;
+                    if was_at_bottom && !self.feed.entries.is_empty() {
+                        self.scroll = self.feed.entries.len() - 1;
                     }
                     self.dirty = true;
                 }

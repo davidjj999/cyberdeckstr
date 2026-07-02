@@ -28,16 +28,17 @@ This project is **cyberdeckstr**, a high-fidelity, cyberpunk-aesthetic Nostr cli
 *   **Logs:** Rolling daily log files are written to `logs/cyberdeckstr.log`.
 
 ## Development Conventions
-*   **Message-Passing Concurrency:** Background tasks communicate with the main loop via `mpsc::Sender<AppMessage>`. The main loop is the sole owner of `App` — no `Arc<Mutex>` contention. All state mutations flow through `App::handle_message()`.
+*   **Feed Entry Format:** `FeedEntry` is a rich struct (`author`, `kind`, `content`, `is_reply`, `nip05`) carried inside `AppMessage::NostrEvent`. The old flat `display: String` was replaced. Reposts (Kind 6) are tagged as `FeedEntryKind::Repost`; replies are detected via `#e` tags; NIP-05 identifiers are resolved from Kind 0 metadata and rendered as a `[✓domain]` badge.
 *   **Domain Sub-States:** `App` delegates to `FeedState` (messages, dedup, text-wrap cache), `MarketState` (price history, cached chart bounds), and `NodeState` (blocks, mempool, fees). Each sub-state owns its data and methods.
 *   **UI State:** Uses a "dirty flag" pattern in `App` to avoid redundant TUI renders. Named `LayoutSlots` replace index arithmetic for layout regions.
-*   **Styling:** Cyberpunk aesthetic (Neon Green, Pink, Cyan) is strictly enforced in `src/ui.rs`. Colour constants are defined at module scope.
+*   **Styling:** Cyberpunk aesthetic (Neon Green, Pink, Cyan) is strictly enforced in `src/ui.rs`. Colour constants are defined at module scope. URLs in note content are rendered in bright blue with underline. NIP-05 badges use green.
 *   **Error Handling:** Uses `anyhow::Result` for application-level errors. `tracing` logs errors to file instead of silently discarding them. A panic hook restores terminal state before printing backtraces.
 *   **Memory Management:** Bounded ring buffers for messages (`MAX_MESSAGES = 2000`) and seen event IDs (`MAX_SEEN_IDS = 5000`) with LRU eviction. Uses `EventId` (fixed-size) instead of heap-allocated `String` for dedup keys.
 *   **Performance Caching:** Chart axis bounds are recomputed only when price data changes. Text wrapping is cached per-message and invalidated on terminal resize.
 
 ## Key Features to Maintain
-*   **Identity Resolution:** Automatically resolves `npub` to display names via metadata (Kind 0) events.
+*   **Rich Feed Format:** Reposts (Kind 6) show a `↻` marker, replies are detected via `#e` tags, NIP-05 verified authors get a `[✓domain]` badge, and URLs in note content are highlighted in bright blue.
+*   **Identity Resolution:** Automatically resolves `npub` to display names and NIP-05 internet identifiers via metadata (Kind 0) events.
 *   **Relay Optimization:** Dynamically discovers and connects to relays based on the user's follow list (Kind 10002).
 *   **Blockchain Viz:** Real-time dashboard for Bitcoin blocks, mempool, and fees when a node is configured.
 *   **Adaptive Polling:** The main loop adjusts polling frequency based on user activity to save CPU.

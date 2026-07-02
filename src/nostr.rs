@@ -1,9 +1,15 @@
-use crate::app::AppMessage;
+use crate::app::{AppMessage, FeedEntryKind};
 use anyhow::Result;
 use nostr_sdk::prelude::*;
 use std::collections::HashMap;
 use std::time::Duration;
 use tokio::sync::mpsc;
+
+/// Resolved author metadata carried alongside the display name.
+struct AuthorInfo {
+    display_name: String,
+    nip05: Option<String>,
+}
 
 /// Top-level Nostr connection lifecycle.
 ///
@@ -176,12 +182,12 @@ async fn optimize_relays(
     tracing::info!("Relay optimization complete — {} relays added", top_relays.len());
 }
 
-/// Fetch Kind 0 metadata for all follows and build a pubkey → display name map.
+/// Fetch Kind 0 metadata for all follows and build a pubkey → AuthorInfo map.
 async fn resolve_metadata(
     client: &Client,
     follows: &[PublicKey],
     tx: &mpsc::Sender<AppMessage>,
-) -> HashMap<PublicKey, String> {
+) -> HashMap<PublicKey, AuthorInfo> {
     let _ = tx.send(AppMessage::NostrStatus("RESOLVING IDENTITIES...".to_string())).await;
 
     let metadata_filter = Filter::new()
@@ -203,7 +209,8 @@ async fn resolve_metadata(
                 .display_name
                 .or(metadata.name)
                 .unwrap_or_else(|| "Unknown".to_string());
-            author_map.insert(event.pubkey, name);
+            let nip05 = metadata.nip05.filter(|s| !s.is_empty());
+            author_map.insert(event.pubkey, AuthorInfo { display_name: name, nip05 });
         }
     }
 
@@ -218,7 +225,7 @@ async fn resolve_metadata(
 /// is re-established (preventing a silent feed after reconnect).
 async fn run_event_loop(
     client: Client,
-    author_map: HashMap<PublicKey, String>,
+    author_map: HashMap<PublicKey, AuthorInfo>,
     tx: &mpsc::Sender<AppMessage>,
     filter: Filter,
 ) {
@@ -240,22 +247,50 @@ async fn run_event_loop(
                         last_data_time = std::time::Instant::now();
 
                         if let RelayPoolNotification::Event { event, .. } = notification {
-                            if event.kind == Kind::TextNote {
-                                let content = clean_content(&event.content);
-                                let author_name = author_map
-                                    .get(&event.pubkey)
-                                    .cloned()
-                                    .unwrap_or_else(|| {
-                                        let pk_str = event.pubkey.to_string();
-                                        format!("{}...", &pk_str[0..8])
-                                    });
+                            // Determine kind: Repost vs TextNote
+                            let kind = if event.kind == Kind::Repost {
+                                FeedEntryKind::Repost
+                            } else {
+                                FeedEntryKind::TextNote
+                            };
 
-                                let display = format!("@{}: {}", author_name, content);
-                                let _ = tx.send(AppMessage::NostrEvent {
-                                    id: event.id,
-                                    display,
-                                }).await;
+                            // Only render TextNote and Repost events
+                            if !matches!(kind, FeedEntryKind::TextNote | FeedEntryKind::Repost) {
+                                continue;
                             }
+
+                            // Resolve author info
+                            let author_info = author_map.get(&event.pubkey);
+                            let author_name = author_info
+                                .map(|a| a.display_name.clone())
+                                .unwrap_or_else(|| {
+                                    let pk_str = event.pubkey.to_string();
+                                    format!("{}...", &pk_str[0..8])
+                                });
+                            let nip05 = author_info.and_then(|a| a.nip05.clone());
+
+                            // Detect reply via #e tags
+                            let is_reply = event.tags.iter().any(|t| {
+                                let s = t.as_slice();
+                                s.len() >= 2 && s[0] == "e"
+                            });
+
+                            // Extract content: for reposts the content field carries
+                            // the original event, but we show the repost marker.
+                            let content = if kind == FeedEntryKind::Repost {
+                                "(reposted note)".to_string()
+                            } else {
+                                clean_content(&event.content)
+                            };
+
+                            let _ = tx.send(AppMessage::NostrEvent {
+                                id: event.id,
+                                author: author_name,
+                                kind,
+                                content,
+                                is_reply,
+                                nip05,
+                            }).await;
                         }
                     }
                     Err(e) => {

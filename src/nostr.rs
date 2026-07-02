@@ -46,12 +46,12 @@ async fn connect_nostr_inner(npub_str: &str, tx: &mpsc::Sender<AppMessage>) -> R
         .kind(Kind::TextNote)
         .authors(follows)
         .limit(20);
-    client.subscribe(subscription, None).await?;
+    client.subscribe(subscription.clone(), None).await?;
 
     let _ = tx.send(AppMessage::NostrConnected).await;
     tracing::info!("Nostr feed subscription active");
 
-    run_event_loop(client, author_map, tx).await;
+    run_event_loop(client, author_map, tx, subscription).await;
     Ok(())
 }
 
@@ -213,10 +213,14 @@ async fn resolve_metadata(
 
 /// Long-running notification loop with periodic health checks for
 /// stale connections (e.g. after system suspend/resume).
+///
+/// The `filter` is stored so it can be re-issued whenever the connection
+/// is re-established (preventing a silent feed after reconnect).
 async fn run_event_loop(
     client: Client,
     author_map: HashMap<PublicKey, String>,
     tx: &mpsc::Sender<AppMessage>,
+    filter: Filter,
 ) {
     let mut notifications = client.notifications();
 
@@ -260,7 +264,7 @@ async fn run_event_loop(
                             "CONNECTION LOST. RECONNECTING...".to_string(),
                         )).await;
 
-                        reconnect(&client, &mut notifications).await;
+                        reconnect(&client, &mut notifications, &filter).await;
 
                         let _ = tx.send(AppMessage::NostrStatus(
                             "RECONNECTED. SIGNAL ACQUIRED.".to_string(),
@@ -278,7 +282,7 @@ async fn run_event_loop(
                         "STALE CONNECTION DETECTED. RECONNECTING...".to_string(),
                     )).await;
 
-                    reconnect(&client, &mut notifications).await;
+                    reconnect(&client, &mut notifications, &filter).await;
 
                     let _ = tx.send(AppMessage::NostrStatus(
                         "RECONNECTED. SIGNAL ACQUIRED.".to_string(),
@@ -290,14 +294,23 @@ async fn run_event_loop(
     }
 }
 
-/// Disconnect, wait briefly, reconnect, and re-acquire the notifications channel.
+/// Disconnect, wait briefly, reconnect, re-subscribe, and re-acquire the
+/// notifications channel.  The `filter` is re-issued so that the subscription
+/// survives reconnection (the root cause of silent feeds after suspend).
 async fn reconnect(
     client: &Client,
     notifications: &mut tokio::sync::broadcast::Receiver<RelayPoolNotification>,
+    filter: &Filter,
 ) {
     client.disconnect().await;
     tokio::time::sleep(Duration::from_secs(2)).await;
     client.connect().await;
+
+    // Re-issue the subscription — relays forget our filters on disconnect.
+    if let Err(e) = client.subscribe(filter.clone(), None).await {
+        tracing::warn!("Failed to re-subscribe after reconnect: {}", e);
+    }
+
     *notifications = client.notifications();
 }
 

@@ -6,7 +6,7 @@ use ratatui::{
     symbols,
     Frame,
 };
-use crate::app::{App, AppState};
+use crate::app::{App, AppState, FeedEntryKind};
 
 // ---------------------------------------------------------------------------
 // Cyberpunk colour palette
@@ -16,6 +16,10 @@ const CYBER_GREEN: Color = Color::Rgb(0, 255, 65);
 const CYBER_PINK: Color = Color::Rgb(255, 0, 255);
 const CYBER_CYAN: Color = Color::Rgb(0, 240, 255);
 const CYBER_BLACK: Color = Color::Rgb(10, 10, 16);
+
+// Additional semantic colours for rich feed rendering
+const REPOST_COLOR: Color = Color::Rgb(180, 130, 255);  // muted purple
+const URL_COLOR: Color = Color::Rgb(80, 200, 255);      // bright blue
 
 // ---------------------------------------------------------------------------
 // Named layout slots — eliminates fragile index arithmetic
@@ -205,6 +209,22 @@ fn render_chart(f: &mut Frame, area: Rect, app: &App, border_style: Style) {
     f.render_widget(chart, area);
 }
 
+/// Split a text line into `Span`s, highlighting URLs in a distinct style.
+fn style_line_with_urls(line: &str, base: Style, url_style: Style) -> Vec<Span<'static>> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    for (i, word) in line.split(' ').enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(" ", base));
+        }
+        let is_url = word.starts_with("http://") || word.starts_with("https://");
+        spans.push(Span::styled(word.to_string(), if is_url { url_style } else { base }));
+    }
+    if spans.is_empty() {
+        spans.push(Span::styled(line.to_string(), base));
+    }
+    spans
+}
+
 fn render_blockchain_viz(
     f: &mut Frame,
     viz_area: Rect,
@@ -341,16 +361,62 @@ fn render_content(
             f.render_widget(loading, area);
         }
         AppState::Feed => {
-            // Use pre-wrapped text from FeedState cache
+            let url_style = Style::default().fg(URL_COLOR).add_modifier(Modifier::UNDERLINED);
+
+            // Build rich ListItems from entries + cached wrapped content
             let messages: Vec<ListItem> = app
                 .feed
-                .wrapped_messages
+                .entries
                 .iter()
-                .map(|wrapped_lines| {
-                    let mut lines = vec![Line::from(Span::raw(""))]; // spacer
-                    for line in wrapped_lines {
-                        lines.push(Line::from(Span::styled(line.clone(), text_style)));
+                .zip(app.feed.wrapped_content.iter())
+                .map(|(entry, wrapped_lines)| {
+                    let mut lines: Vec<Line> = Vec::new();
+
+                    // ── Header line ──────────────────────────────────
+                    let mut header_spans: Vec<Span> = Vec::new();
+
+                    // Kind: Repost marker
+                    if entry.kind == FeedEntryKind::Repost {
+                        header_spans.push(Span::styled(
+                            "↻ ",
+                            Style::default().fg(REPOST_COLOR).add_modifier(Modifier::BOLD),
+                        ));
                     }
+
+                    // Author name + NIP-05 badge + reply indicator
+                    // all use CYBER_GREEN so the header reads as one unit.
+                    // (The selected-item cyan is handled by highlight_style on the List widget.)
+                    let header_style = Style::default().fg(CYBER_GREEN).add_modifier(Modifier::BOLD);
+
+                    header_spans.push(Span::styled(
+                        format!("@{}", entry.author),
+                        header_style,
+                    ));
+
+                    if let Some(nip05) = &entry.nip05 {
+                        header_spans.push(Span::raw(" "));
+                        header_spans.push(Span::styled(
+                            format!("[✓{}]", nip05),
+                            header_style,
+                        ));
+                    }
+
+                    if entry.is_reply {
+                        header_spans.push(Span::raw(" "));
+                        header_spans.push(Span::styled("(reply)", header_style));
+                    }
+
+                    lines.push(Line::from(header_spans));
+
+                    // ── Content lines with URL highlighting ─────────
+                    for line_str in wrapped_lines {
+                        let styled_spans = style_line_with_urls(line_str, text_style, url_style);
+                        lines.push(Line::from(styled_spans));
+                    }
+
+                    // Spacer between entries
+                    lines.push(Line::from(Span::raw("")));
+
                     ListItem::new(lines)
                 })
                 .collect();

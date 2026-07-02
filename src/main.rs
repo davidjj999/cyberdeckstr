@@ -210,8 +210,8 @@ async fn run_app<B: Backend>(
                                     match key.code {
                                         KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
                                         KeyCode::Down => {
-                                            if !app.feed.messages.is_empty()
-                                                && app.scroll < app.feed.messages.len() - 1
+                                            if !app.feed.entries.is_empty()
+                                                && app.scroll < app.feed.entries.len() - 1
                                             {
                                                 app.scroll += 1;
                                             }

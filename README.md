@@ -9,14 +9,16 @@ A high-fidelity, cyberpunk-aesthetic Nostr client for your terminal.
 CYBERDECKSTR is a TUI (Terminal User Interface) client for the Nostr protocol, built in Rust. It is designed for those who prefer the command line and enjoy a bit of retro-future flair.
 
 **Features:**
+*   **Rich Feed Format:** Reposts marked with `↻`, reply chains detected via `#e` tags, NIP-05 verified authors show a `[✓domain]` badge, and URLs are highlighted in distinct blue.
 *   **Read-Only Feed:** Connects to Nostr relays and streams notes from your follow list.
-*   **Identity Resolution:** Automatically resolves `npub` identities to display names via Kind 0 metadata.
+*   **Identity Resolution:** Automatically resolves `npub` identities to display names and NIP-05 identifiers via Kind 0 metadata.
 *   **Relay Optimization:** Discovers and connects to relays where your follows actually post (Kind 10002).
 *   **Bitcoin Dashboard:** Optional real-time visualization of blocks, mempool, and fee estimates from a local Bitcoin Core node.
 *   **BTC Price Chart:** 24-hour BTC/USD price chart via CoinGecko (always on).
+*   **System Monitor:** Live CPU, GPU, RAM, VRAM, and network speed readouts — zero external dependencies.
 *   **Cyberpunk UI:** Custom neon styling (green, pink, cyan on black) using `ratatui`.
 *   **Lightning Fast:** Lock-free, message-passing architecture built on `tokio`.
-*   **Connection Resilience:** Auto-reconnects on stale connections and system suspend/resume.
+*   **Connection Resilience:** Auto-reconnects on stale connections and system suspend/resume — subscriptions are re-issued so the feed never goes silent.
 
 ## Installation
 
@@ -47,7 +49,13 @@ CYBERDECKSTR is a TUI (Terminal User Interface) client for the Nostr protocol, b
 1.  Launch the application.
 2.  Paste your **npub** (public key) when prompted (or configure it in `config.toml` for auto-login).
 3.  The client will jack into the matrix, discover your follows' preferred relays, resolve their identities, and display a live stream of their notes.
-4.  **Navigate:** `↑`/`↓` to scroll, `q` or `Esc` to quit.
+4.  **Navigate:** `↑`/`↓` to scroll through the feed, `q` or `Esc` to quit.
+
+    Entries show event metadata inline:
+    *   `↻ @author` — a repost (Kind 6).
+    *   `@author [✓user@domain]` — NIP-05 verified author.
+    *   `@author (reply)` — a note that replies to another event.
+    *   Blue underlined text — detected URLs in note content.
 
 ## Configuration (Optional)
 

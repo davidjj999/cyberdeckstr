@@ -45,19 +45,45 @@ async fn connect_nostr_inner(npub_str: &str, tx: &mpsc::Sender<AppMessage>) -> R
 
     let follows = discover_follows(&client, public_key).await;
     optimize_relays(&client, &follows, tx).await;
-    let author_map = resolve_metadata(&client, &follows, tx).await;
+    let mut author_map = resolve_metadata(&client, &follows, tx).await;
 
-    // Subscribe to text notes from the follow list
+    // Self-resolution safeguard: the one-shot metadata burst above can miss
+    // our own profile (relay timing, or a profile that has migrated to relays
+    // outside the queried set) — the root cause of self-authored notes being
+    // rendered as "@npub…". Retry with a dedicated self-only fetch so the
+    // logged-in identity always resolves whenever it is reachable.
+    if !author_map.contains_key(&public_key) {
+        let self_filter = Filter::new().kind(Kind::Metadata).author(public_key);
+        if let Ok(events) = client.fetch_events(self_filter, Duration::from_secs(10)).await {
+            for event in events {
+                if let Ok(metadata) = Metadata::from_json(&event.content) {
+                    author_map.insert(event.pubkey, author_info_from_metadata(&metadata));
+                }
+            }
+        }
+    }
+
+    // Author display names are streamed live through their OWN dedicated
+    // subscription, kept separate from the feed subscription. Merging
+    // Metadata into the TextNote filter would let the `limit(20)` — which
+    // relays count across BOTH kinds — be consumed by recent notes and
+    // crowd out the usually-old Kind 0 events, so profiles would never be
+    // delivered. Separate filters make profile delivery unconditional.
     let subscription = Filter::new()
         .kind(Kind::TextNote)
-        .authors(follows)
+        .authors(follows.clone())
         .limit(20);
+    let metadata_subscription = Filter::new()
+        .kind(Kind::Metadata)
+        .authors(follows);
+
     client.subscribe(subscription.clone(), None).await?;
+    client.subscribe(metadata_subscription.clone(), None).await?;
 
     let _ = tx.send(AppMessage::NostrConnected).await;
     tracing::info!("Nostr feed subscription active");
 
-    run_event_loop(client, author_map, tx, subscription).await;
+    run_event_loop(client, author_map, tx, subscription, metadata_subscription).await;
     Ok(())
 }
 
@@ -182,6 +208,17 @@ async fn optimize_relays(
     tracing::info!("Relay optimization complete — {} relays added", top_relays.len());
 }
 
+/// Extract the display name + NIP-05 from parsed Kind 0 metadata.
+fn author_info_from_metadata(metadata: &Metadata) -> AuthorInfo {
+    let name = metadata
+        .display_name
+        .clone()
+        .or_else(|| metadata.name.clone())
+        .unwrap_or_else(|| "Unknown".to_string());
+    let nip05 = metadata.nip05.clone().filter(|s| !s.is_empty());
+    AuthorInfo { display_name: name, nip05 }
+}
+
 /// Fetch Kind 0 metadata for all follows and build a pubkey → AuthorInfo map.
 async fn resolve_metadata(
     client: &Client,
@@ -205,12 +242,7 @@ async fn resolve_metadata(
     let mut author_map = HashMap::new();
     for event in metadata_events {
         if let Ok(metadata) = Metadata::from_json(&event.content) {
-            let name = metadata
-                .display_name
-                .or(metadata.name)
-                .unwrap_or_else(|| "Unknown".to_string());
-            let nip05 = metadata.nip05.filter(|s| !s.is_empty());
-            author_map.insert(event.pubkey, AuthorInfo { display_name: name, nip05 });
+            author_map.insert(event.pubkey, author_info_from_metadata(&metadata));
         }
     }
 
@@ -221,13 +253,14 @@ async fn resolve_metadata(
 /// Long-running notification loop with periodic health checks for
 /// stale connections (e.g. after system suspend/resume).
 ///
-/// The `filter` is stored so it can be re-issued whenever the connection
-/// is re-established (preventing a silent feed after reconnect).
+/// Both subscription filters are stored so they can be re-issued whenever the
+/// connection is re-established (preventing a silent feed after reconnect).
 async fn run_event_loop(
     client: Client,
-    author_map: HashMap<PublicKey, AuthorInfo>,
+    mut author_map: HashMap<PublicKey, AuthorInfo>,
     tx: &mpsc::Sender<AppMessage>,
-    filter: Filter,
+    subscription: Filter,
+    metadata_subscription: Filter,
 ) {
     let mut notifications = client.notifications();
 
@@ -247,6 +280,19 @@ async fn run_event_loop(
                         last_data_time = std::time::Instant::now();
 
                         if let RelayPoolNotification::Event { event, .. } = notification {
+                            // Live profile metadata: refresh the author map so display
+                            // names / NIP-05 resolve (and stay current) even for authors
+                            // whose profile was missing from the initial one-shot fetch.
+                            if event.kind == Kind::Metadata {
+                                if let Ok(metadata) = Metadata::from_json(&event.content) {
+                                    author_map.insert(
+                                        event.pubkey,
+                                        author_info_from_metadata(&metadata),
+                                    );
+                                }
+                                continue;
+                            }
+
                             // Determine kind: Repost vs TextNote
                             let kind = if event.kind == Kind::Repost {
                                 FeedEntryKind::Repost
@@ -299,7 +345,12 @@ async fn run_event_loop(
                             "CONNECTION LOST. RECONNECTING...".to_string(),
                         )).await;
 
-                        reconnect(&client, &mut notifications, &filter).await;
+                        reconnect(
+                            &client,
+                            &mut notifications,
+                            &subscription,
+                            &metadata_subscription,
+                        ).await;
 
                         let _ = tx.send(AppMessage::NostrStatus(
                             "RECONNECTED. SIGNAL ACQUIRED.".to_string(),
@@ -317,7 +368,12 @@ async fn run_event_loop(
                         "STALE CONNECTION DETECTED. RECONNECTING...".to_string(),
                     )).await;
 
-                    reconnect(&client, &mut notifications, &filter).await;
+                    reconnect(
+                        &client,
+                        &mut notifications,
+                        &subscription,
+                        &metadata_subscription,
+                    ).await;
 
                     let _ = tx.send(AppMessage::NostrStatus(
                         "RECONNECTED. SIGNAL ACQUIRED.".to_string(),
@@ -335,15 +391,18 @@ async fn run_event_loop(
 async fn reconnect(
     client: &Client,
     notifications: &mut tokio::sync::broadcast::Receiver<RelayPoolNotification>,
-    filter: &Filter,
+    subscription: &Filter,
+    metadata_subscription: &Filter,
 ) {
     client.disconnect().await;
     tokio::time::sleep(Duration::from_secs(2)).await;
     client.connect().await;
 
-    // Re-issue the subscription — relays forget our filters on disconnect.
-    if let Err(e) = client.subscribe(filter.clone(), None).await {
-        tracing::warn!("Failed to re-subscribe after reconnect: {}", e);
+    // Re-issue both subscriptions — relays forget our filters on disconnect.
+    for f in [subscription, metadata_subscription] {
+        if let Err(e) = client.subscribe(f.clone(), None).await {
+            tracing::warn!("Failed to re-subscribe after reconnect: {}", e);
+        }
     }
 
     *notifications = client.notifications();
